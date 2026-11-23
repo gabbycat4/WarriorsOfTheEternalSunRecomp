@@ -112,3 +112,15 @@ Fix: GameSpec.pad_latch_at_vint (opt-in, default 0 = unchanged): machine_set_pad
 state until the vblank line and applies it right before the V-int (BlastEm-like).
 wotes_spec.c sets it. Engine patch now: patches/segagenesisrecomp-wotes-fixes.patch
 (floor JMP-tail return slot + pad latch).
+
+## Phase 1 coverage round 1 (Nov 23)
+Evidence: evidence/2026-11-22 + evidence/2026-11-23 floor_coverage (310 addresses),
+interpreter runs coverage/*.txt (19,100 PCs). tools/fold_floor.py (RKA rules, recompiler's own
+decoder via tools/m68k_runs.c): 91 accepted -> game/wotes_floor_fold.discovery.toml (late_extra),
+203 already functions, 9 not yet seen by an interpreter run, 7 inside existing functions
+(stub-table labels $011E32-3E, $00701E in func_006F48, $01FD5C, $01FEE2).
+New codegen pattern found by the bigger function set: $02054E (func $02049E) JMP into a table
+of bare BRA.S entries -> probe_stub_table_rom handles bare-branch tables (in_function_switch).
+Result (regen here): functions 958 -> 1060, native instructions 25,182 -> 28,508
+(gate tools/compare_native.py: lost 0), dispatch audit INTERIOR_UNRESOLVED 0.
+Hook list (WOTES_INTERP) regenerated: 1058 routines.

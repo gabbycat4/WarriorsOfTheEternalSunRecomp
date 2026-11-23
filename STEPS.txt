@@ -1,6 +1,7 @@
-# ===== Step 16: rebuild with the controller-latch fix (engine runtime: quick) =====
+# ===== Step 17: coverage round 1 (recompiler + config changed: full regen, a few minutes) =====
 cd ~/Projects/WarriorsOfTheEternalSunRecomp
 cmake --build build --target WotESRecomp
 ./build/WotESRecomp game/wotes.bin
-# Test: read a gravestone and the cursed-water grave; one press of Cross or Circle
-# should close the box, like in BlastEm. Then try other menus/text quickly.
+# Play the same kinds of things as before (town, cave, graveyard, battles, camp,
+# shops). If all is well, commit:
+#   git add . && git commit -m "Coverage round 1: 91 floor roots, bare BRA tables"
