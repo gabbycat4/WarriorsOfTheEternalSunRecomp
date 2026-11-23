@@ -195,3 +195,14 @@ core + in-between picture support in the Genesis engine (doesn't exist yet).
 ### Phase 2 result 2b: dungeon confirmed with VRAM hash (measurements/dungeon-2.log)
 Each step = 2 new views ~8 frames apart, each uploaded over 1-2 frames (VRAM changes +0/+1 and
 +8/+9); turns = 2 views, each uploaded over ~4 frames. No scroll, no gradual animation.
+
+## GitHub (Nov 23)
+Game repo: github.com/gabbycat4/WarriorsOfTheEternalSunRecomp (private for now, branch master).
+Engine forks, branch "wotes" (local remote name "fork"; origin = mstan):
+  gabbycat4/segagenesisrecomp  wotes 5e1885c  (runner fixes; points at the m68k fix)
+  gabbycat4/m68k-recomp-core   wotes 023c748  (codegen fixes)
+  gabbycat4/z80-recomp-core    (unchanged; needed because the engine uses relative submodule URLs)
+Future engine change, inside-out: commit+push in segagenesisrecomp/external/m68k-recomp-core
+(branch wotes) -> in segagenesisrecomp: git add external/m68k-recomp-core (+ runner files),
+commit, push fork wotes -> in the game repo: git add segagenesisrecomp, commit, push.
+patches/*.patch are now only a record. Later: pull requests to mstan from the wotes branches.
