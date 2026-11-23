@@ -1,0 +1,143 @@
+diff --git a/runner/game_spec.h b/runner/game_spec.h
+index a135a9b..703b6ed 100644
+--- a/runner/game_spec.h
++++ b/runner/game_spec.h
+@@ -107,6 +107,17 @@ typedef struct GameSpec {
+      * coverage and keep it off so a miss stays a loud regression). */
+     int         tier3_floor_default;
+ 
++    /* ---- Controller latch point (opt-in) ----
++     * 0 (default): a wall frame's new controller state is applied at the
++     * start of the raster frame (line 0), as before.
++     * 1: hold the new state until the vblank line and apply it just before
++     * the V-int is delivered, like emulators that poll input at vblank.
++     * For games whose main loop overruns the frame and polls the pad from
++     * several places with edge detection: with the line-0 latch, the same
++     * mid-frame reader always consumes every new press first (Warriors of
++     * the Eternal Sun: text boxes never closed). */
++    int         pad_latch_at_vint;
++
+     /* Optional statically-recompiled Z80 coprocessor backend. The generated
+      * function executes exactly one instruction from the explicit Z80 PC and
+      * returns; the shared Genesis scheduler remains responsible for cycle
+diff --git a/runner/glue.c b/runner/glue.c
+index 4d92b6a..b6be059 100644
+--- a/runner/glue.c
++++ b/runner/glue.c
+@@ -2309,6 +2309,10 @@ static int floor_enabled(void) {
+     return e;
+ }
+ 
++static uint32_t s_jmp_tail_target;
++static uint32_t s_jmp_tail_a7;
++extern int g_split_sp_popped;
++
+ void genesis_log_dispatch_miss(uint32_t addr)
+ {
+     g_miss_count_any++;
+@@ -2340,7 +2344,17 @@ void genesis_log_dispatch_miss(uint32_t addr)
+                           ? g_game_spec.expected_rom_size : (uint32_t)sizeof(g_rom);
+         /* The native loose-A7 return the caller (JSR site / enclosing JSR) is
+          * about to pop — the capsule must return exactly here to be safe. */
+-        uint32_t expected_ret = glue_peek32(g_cpu.A[7]) & 0xFFFFFFu;
++        uint32_t ret_slot = g_cpu.A[7];
++        int jmp_tail_skip = 0;
++        if ((addr & 0xFFFFFFu) == s_jmp_tail_target && g_cpu.A[7] == s_jmp_tail_a7 &&
++            g_split_sp_popped < 0) {
++            /* Computed-JMP tail from a routine that still holds pushed
++             * bytes: its return slot is below them (see hybrid_jmp_interpret). */
++            jmp_tail_skip = -g_split_sp_popped;
++            ret_slot += (uint32_t)jmp_tail_skip;
++        }
++        s_jmp_tail_target = 0xFFFFFFFFu;     /* one dispatch only */
++        uint32_t expected_ret = glue_peek32(ret_slot) & 0xFFFFFFu;
+         uint32_t run_at = addr;
+ 
+         /* RAM-resident computed target: follow the JMP/JSR trampoline chain
+@@ -2370,6 +2384,9 @@ void genesis_log_dispatch_miss(uint32_t addr)
+                 int plausible = exit_pc && !(exit_pc & 1u) &&
+                                 (exit_pc < rl || exit_pc >= RAM_BASE);
+                 if (plausible && exit_pc == expected_ret) {
++                    /* The capsule ran the routine through its own pops to the
++                     * real return: the carried push has been consumed. */
++                    if (jmp_tail_skip) g_split_sp_popped = 0;
+                     /* Clean balanced return to the native continuation. Manifest
+                      * the entry + its call/jump subtree as real code leads. */
+                     floor_record_coverage(addr, addr);
+@@ -2609,10 +2626,23 @@ uint32_t glue_interp_seen_addr(int i) {
+     return (i >= 0 && i < s_interp_seen_count) ? s_interp_seen[i] : 0;
+ }
+ 
++/* A computed JMP is a tail edge: the generated caller has carried the
++ * routine's net stack push (e.g. an entry MOVEM) into g_split_sp_popped
++ * (negative bytes) before getting here. If this target misses and the
++ * Tier-3 floor runs it, the routine's real return address is BELOW those
++ * pushed bytes, not on top of the stack. Arm that information for exactly
++ * this dispatch (same target, same A7) so genesis_log_dispatch_miss() can
++ * validate the capsule against the right return slot. */
++static uint32_t s_jmp_tail_target = 0xFFFFFFFFu;
++static uint32_t s_jmp_tail_a7;
++
+ void hybrid_jmp_interpret(uint32_t target_pc)
+ {
+     g_interp_total_calls++;
++    s_jmp_tail_target = target_pc & 0xFFFFFFu;
++    s_jmp_tail_a7 = g_cpu.A[7];
+     call_by_address(target_pc);
++    s_jmp_tail_target = 0xFFFFFFFFu;
+     /* If call_by_address didn't find it, genesis_log_dispatch_miss
+      * was called, which logs it as a true miss via log_true_miss. */
+ }
+diff --git a/runner/video/genesis_machine.c b/runner/video/genesis_machine.c
+index 9718e2f..290933a 100644
+--- a/runner/video/genesis_machine.c
++++ b/runner/video/genesis_machine.c
+@@ -4,6 +4,7 @@
+  * Z80, and our VDP, delivering V/H interrupts. Original implementation.
+  */
+ #include "genesis_machine.h"
++#include "../game_spec.h"   /* pad_latch_at_vint */
+ #if GENESIS_HD_JOBS
+ #include "genesis_raster_jobs.h"
+ #endif
+@@ -362,8 +363,26 @@ int machine_rb_load(const void *src, size_t len)
+     return 1;
+ }
+ 
++/* Controller state waiting for the vblank line (GameSpec.pad_latch_at_vint).
++ * Always consumed inside the same machine_run_frame_ex, so it is never live
++ * across a wall-frame boundary (snapshots/rollback see only bus.pad). */
++static uint16_t s_pad_pending[2];
++static int      s_pad_pending_set[2];
++
++static void machine_apply_pad(int port, uint16_t buttons)
++{
++    g_machine.bus.pad[port] = buttons;
++    g_machine.bus.pad_th_count[port] = 0;
++    g_machine.bus.pad_th_prev[port]  = g_machine.bus.io_data[port] & 0x40;
++}
++
+ void machine_set_pad(int port, uint16_t buttons)
+ {
++    if (port >= 0 && port < 2 && g_game_spec.pad_latch_at_vint) {
++        s_pad_pending[port] = buttons;
++        s_pad_pending_set[port] = 1;
++        return;
++    }
+     if (port >= 0 && port < 2) {
+         g_machine.bus.pad[port] = buttons;
+         /* New read burst this frame: clear the 6-button TH edge counter so the
+@@ -684,6 +703,13 @@ void machine_run_frame_ex(GenesisScanlineSink sink, void *user,
+ #else
+             m->z80.int_pending = 1;   /* level-triggered vblank IRQ assert */
+ #endif
++            /* Opt-in vblank controller latch: the first pad read after the
++             * new state is the one that follows the V-int. */
++            for (int port = 0; port < 2; port++)
++                if (s_pad_pending_set[port]) {
++                    machine_apply_pad(port, s_pad_pending[port]);
++                    s_pad_pending_set[port] = 0;
++                }
+             glue_own_interrupt(6, &m->vdp);
+         }
+ 

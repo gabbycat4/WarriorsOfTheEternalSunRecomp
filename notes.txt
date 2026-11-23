@@ -81,3 +81,34 @@ Fix: carry g_split_sp_popped += _sp_popped before hybrid_jmp_interpret (switch d
 and plain fallback) when the function tracks _sp_popped; reset it after the handler
 chain returns. 16 sites. Both engine fixes now in patches/m68k-recomp-core-wotes-fixes.patch
 (stub tables + this carry). Upstream candidates.
+
+Party creation (only 1 character, Nov 21): FIXED by the stack-carry fix (retested Nov 22 in native mode: all four characters, no issues).
+Cave save backed up as build/wotes.srm.backup-cave.
+
+## Graveyard: "...the water was cursed." then stuck (Nov 22)
+floor_unsafe $00D114 (session 3 frame 10374): run_at $00D114 exit $00CDDC expected $840034.
+$00D106: MOVEM.L d1-d2/a0,-(sp) (12 B); ADD.W d0,d0; JMP 2(pc,d0.w) -> $00D110:
+BRA.S $D148, BRA.S $D148, then index 4 lands on inline code at $00D114 (not a function).
+The floor ran it correctly to the real return $00CDDC (after BSR $00D106 at $00CDD8),
+but checked against the top of stack (saved D1) -> "unsafe", declined -> event code
+skipped -> script stuck.
+Fix (runner/glue.c): hybrid_jmp_interpret arms (target, A7); genesis_log_dispatch_miss
+reads the expected return BELOW the routine's carried push (-g_split_sp_popped bytes,
+available since the codegen stack-carry fix) and clears the carry on success.
+patches/segagenesisrecomp-floor-jmp-tail-return.patch.
+Possible later codegen improvement: BRA.S table + inline last case as an in-function switch.
+
+## Grave text boxes never close (Nov 22) -- not the jump fix above
+"He quenched his thirst..." / "Here lies Louise..." boxes: BlastEm closes them with one
+press; recomp (native AND interpreter) never does, except rarely. Probe (tools/wotes_probe.py,
+build/debug.ini enables the debug port 4400) showed the game running normally, per frame:
+  |frame boundary| char path work | $5DE2 | PAD read (party panel $00EAC8) | WAIT $BA70 |
+  V-int | PAD read (text box loop $004846: jsr $5DE2 / jsr $B91C / andi #$F0 / beq) | ...
+$B93C keeps "new presses" = held & ~previous (masked by $FF8005 = $F0 for A/B/C/Start).
+Engine applied new controller state at raster line 0 (machine_set_pad before
+machine_run_frame_ex); the game overruns the frame, so the party-panel read after line 0
+always took every new press and the text box only saw "already held".
+Fix: GameSpec.pad_latch_at_vint (opt-in, default 0 = unchanged): machine_set_pad holds the
+state until the vblank line and applies it right before the V-int (BlastEm-like).
+wotes_spec.c sets it. Engine patch now: patches/segagenesisrecomp-wotes-fixes.patch
+(floor JMP-tail return slot + pad latch).

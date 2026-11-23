@@ -1,5 +1,6 @@
-# ===== Step 12: rebuild with the stack-carry fix (recompiler changed: takes a few minutes) =====
+# ===== Step 16: rebuild with the controller-latch fix (engine runtime: quick) =====
 cd ~/Projects/WarriorsOfTheEternalSunRecomp
 cmake --build build --target WotESRecomp
-# ===== Step 13: test in normal (native) mode, no WOTES_INTERP =====
 ./build/WotESRecomp game/wotes.bin
+# Test: read a gravestone and the cursed-water grave; one press of Cross or Circle
+# should close the box, like in BlastEm. Then try other menus/text quickly.

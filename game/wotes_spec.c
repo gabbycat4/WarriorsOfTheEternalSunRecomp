@@ -139,6 +139,12 @@ const GameSpec g_game_spec = {
      * floor_coverage.toml / dispatch_misses.toml for the next regen. */
     .tier3_floor_default    = 1,
 
+    /* Text boxes wait for a NEW press, but the party panel ($00EAC8) reads the
+     * pad earlier in every (overrunning) frame and would consume each press
+     * if new input arrived at line 0. Latch input at the V-int, as BlastEm
+     * effectively does, so the text box's read right after the V-int gets it. */
+    .pad_latch_at_vint      = 1,
+
     .call_entry_point       = wotes_call_entry_point,
     .call_vblank            = wotes_call_vblank,
     .call_hblank            = NULL,
