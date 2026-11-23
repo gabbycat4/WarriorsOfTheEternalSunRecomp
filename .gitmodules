@@ -1,6 +1,7 @@
 [submodule "segagenesisrecomp"]
 	path = segagenesisrecomp
-	url = https://github.com/mstan/segagenesisrecomp.git
+	url = https://github.com/gabbycat4/segagenesisrecomp.git
+	branch = wotes
 [submodule "recomp-ui"]
 	path = recomp-ui
 	url = https://github.com/mstan/recomp-ui.git
