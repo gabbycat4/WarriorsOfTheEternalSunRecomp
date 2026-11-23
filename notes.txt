@@ -145,3 +145,53 @@ misses. fold_floor.py accepted $012700, $01635C (+ $015960 under it). Pointer-pr
 JSR (A0) at $00A424) and script-table code pointers $022C88, $022D0C.
 Regen: functions 1070 -> 1087, native 28,602 -> 29,115 (+513, lost 0), INTERIOR 0. Hooks 1085.
 Evidence: evidence/2026-11-23-r2/.
+
+## Phase 2: measure (started Nov 23)
+game/wotes_motion.c: WOTES_MOTION_LOG=<file> writes one block per wall frame (format in the
+file header): main-loop passes ("it", counted by a game_hook at the main-loop top $000608),
+pad, all VDP regs, VSRAM A/B, hscroll A/B + per-line table hash, CRAM hash, sprite table in
+link order, and every changed 68000 RAM byte (first frame: full RAM). Off when unset.
+Logs go to measurements/ (git-ignored).
+
+### Phase 2 result 1: world map (measurements/worldmap-1.log, Nov 23, 6036 frames)
+- Game logic: main loop passes once EVERY frame on the map (it=1); battles run their own loop
+  (it=0 there), as do title/menus. Not a 20 Hz map.
+- Camera: exactly 1 px per frame while walking, every frame, H/V/diagonal; planes A and B
+  together (no parallax). Stops only when blocked.
+- Party leader (tile $4F8): fixed at screen centre; world step exactly 1 px/frame (119/119,
+  229/229): perfectly even.
+- Followers ($508/$510/$518): mostly 1 px/frame in the walk direction, but 10-30% of frames
+  are 2 px or diagonal side-steps (they trace the leader's path round corners); very few
+  reversals. NPC ($318): 0/1 px steps.
+- Sprite list order changes between frames (Y sort): track by tile/owner, not slot.
+=> At 60 Hz the map is already as smooth as the game's data allows. 240 Hz in-betweens
+   (2x/4x render) would only reduce hold blur (1 px spread over 4 pictures) and soften the
+   followers' 2-px side-steps. Modest gain; decide after dungeon + battle measurements.
+
+### Phase 2 result 2: dungeon (measurements/dungeon-1.log, 4862 frames)
+- Own loop (main-loop counter 0), scroll registers never change: no scrolling, no sliding turns.
+- View redrawn into RAM (frames with >1000 RAM bytes changed): every step forward AND every
+  turn = 2 redraws 8 frames apart (+1/+9 after the press); held button: a step every ~17
+  frames (~3.5 steps/s). Likely a half-step view + the arrived view.
+- Caveat: counted RAM redraws, not screen pictures. Motion log v2 adds "vh" (whole-VRAM hash)
+  to confirm with a short new dungeon recording.
+=> Arcana case: sliding can't make in-between views. Options: A keep the game's frames
+   (240 = steadier pacing only), C our own 3D renderer (separate big project).
+
+### Phase 2 result 3: battle (measurements/battle-1.log, battle ~frames 3150-9200)
+- Battles on the overhead map, own loop. No palette flashes in this fight.
+- Combatants: jump a whole 8 px tile every 9 frames (~6.7 steps/s), nothing in between
+  (tiles $498, $510, $518). Attack lunge: 6 px out, back 12 frames later.
+- Camera pans: 2-4 px per frame in short bursts. Projectiles/effects ($6B0): 6 px every frame.
+=> Biggest smoothing payoff in the game: 8 px hops -> glides over 9 frames (36 pictures at 240),
+   smoother pans and projectiles. Same method as Lagoon (interpolate between game steps,
+   owners by tile/palette, one step of presentation delay).
+
+### Phase 2 summary / decision
+Priority for Phases 3-4: battle movement + battle camera, then map (hold blur, follower
+side-steps). Dungeon: option A unless we later choose the 3D project. First Phase 3: second
+core + in-between picture support in the Genesis engine (doesn't exist yet).
+
+### Phase 2 result 2b: dungeon confirmed with VRAM hash (measurements/dungeon-2.log)
+Each step = 2 new views ~8 frames apart, each uploaded over 1-2 frames (VRAM changes +0/+1 and
++8/+9); turns = 2 views, each uploaded over ~4 frames. No scroll, no gradual animation.

@@ -26,6 +26,8 @@
 # used by WOTES_INTERP in wotes_spec.c to send chosen routines to the interpreter.
 # No effect unless WOTES_INTERP is set. Generated from the 1085 emitted functions.
 widescreen_site = [
+  # Main-loop top (st $A915), counted by the Phase 2 motion log; never replaced.
+  { addr = 0x000608, kind = "game_hook" },
   { addr = 0x000008, kind = "game_hook" }, { addr = 0x000306, kind = "game_hook" }, { addr = 0x00032E, kind = "game_hook" }, { addr = 0x00057E, kind = "game_hook" },
   { addr = 0x0005A2, kind = "game_hook" }, { addr = 0x000740, kind = "game_hook" }, { addr = 0x00075A, kind = "game_hook" }, { addr = 0x000824, kind = "game_hook" },
   { addr = 0x00082A, kind = "game_hook" }, { addr = 0x00083C, kind = "game_hook" }, { addr = 0x000866, kind = "game_hook" }, { addr = 0x000888, kind = "game_hook" },

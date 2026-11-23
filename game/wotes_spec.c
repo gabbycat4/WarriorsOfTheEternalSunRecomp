@@ -100,8 +100,13 @@ static int wi_entered_by_call(uint32_t ret)
     return 0;
 }
 
+void wotes_motion_main_loop_pass(void);   /* wotes_motion.c */
+void wotes_motion_frame(uint64_t frame);  /* wotes_motion.c */
+
 static int wotes_instruction_hook(uint32_t pc)
 {
+    /* Main-loop pass counter for the motion log (never replaces code). */
+    if (pc == 0x000608u) { wotes_motion_main_loop_pass(); return 0; }
     /* Inside an interpreted routine everything already runs on the
      * interpreter (it calls this hook too): let it continue. */
     if (s_wi_depth || !wi_selected(pc)) return 0;
@@ -155,7 +160,7 @@ const GameSpec g_game_spec = {
 
     .on_post_reset          = NULL,
     .on_frame_pre           = NULL,
-    .on_frame_post          = NULL,
+    .on_frame_post          = wotes_motion_frame,   /* WOTES_MOTION_LOG */
     .on_hblank              = NULL,
 
     .handle_arg             = NULL,

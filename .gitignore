@@ -29,3 +29,6 @@ coverage/
 
 # Decode helper binary for tools/fold_floor.py (build: see tools/m68k_runs.c)
 tools/m68k_runs
+
+# Phase 2 motion logs (large)
+measurements/

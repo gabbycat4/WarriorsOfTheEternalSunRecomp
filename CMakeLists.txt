@@ -45,7 +45,8 @@ genesisrecomp_runner_sources(RUNNER_SOURCES
 add_executable(WotESRecomp
     ${RUNNER_SOURCES}
     ${GENERATED_SOURCES}
-    game/wotes_spec.c)
+    game/wotes_spec.c
+    game/wotes_motion.c)
 add_dependencies(WotESRecomp ${GENERATED_SOURCES_TARGET})
 target_compile_definitions(WotESRecomp PRIVATE
     INCLUDE_GENERATED_CODE=1 ENABLE_RECOMPILED_CODE=1 OWN_BACKEND=1
