@@ -1,0 +1,83 @@
+# Warriors of the Eternal Sun (Genesis) recomp notes
+
+## Phase 0 (Nov 21)
+ROM: warriorsofeternalsun.bin, 1,048,576 bytes (8 Mbit), flat, no mapper
+SHA-1 9135f7fda03ef7da92dfade9c0df75808214f693  = GoodGEN [!] "(UE)" (TASVideos)
+MD5   4f5f970a5fe5936c897bae017d88921e
+CRC32 AF4A9CD7
+Header: "WARRIORS OF THE ETERNAL SUN", GM MK-1304 -00, (C)T-50 1992.APR, region "U"
+Header checksum 0x90C4 = computed (valid)
+Battery save: header "RA" F8 20, $200001-$203FFF (odd bytes). Engine bus maps this
+  from the header automatically (runner/video/genesis_bus.c); check that saves persist.
+Vectors: SSP $FFFFFFF6, entry $000200, V-int (IRQ6) $0009E6.
+  Every other vector (incl. H-int) points at $000200 -> no H-int handler.
+Engine: ~/segagenesisrecomp @ d4c13cf (mstan master), recompiler already built:
+  recompiler/build/GenesisRecomp
+Closest engine examples: rka/ and puyo/ (no disassembly, heuristic discovery,
+  flat ROM, no SRAM). RKA has its own game repo = the layout to copy.
+Ghidra: installed (user, Nov 21). Engine ships Ghidra helpers in ghidra/ and tools/ghidra/.
+
+## Phase 1 (Nov 22)
+Project created: CMakeLists.txt (RKA layout + engine runner module), game/game.toml,
+game/wotes_spec.c (prefix "wotes", exe WotESRecomp, debug port 4400). ROM goes in game/wotes.bin.
+
+BlastEm in-game save imported (Nov 22): BlastEm save.sram = 8 KB of the odd bytes only;
+the recomp wotes.srm = 16 KB raw bus bytes (odd = data, even = 0). Convert: out[1::2] = blastem.
+Old recomp save kept as build/wotes.srm.before-blastem. BlastEm .state files are not loadable by the recomp.
+
+## Dungeon "can't move forward" (Nov 22)
+Cause: JMP (d8,PC,Xn) into a table of 4-byte code stubs (one instruction + BRA to a
+common join, last stub falls through), indexed by facing*4. Example $010380:
+  andi.w #3,d2 / asl.w #2,d2 / jmp 2(pc,d2.w) / subq.w #1,d1;bra / addq.w #1,d0;bra /
+  addq.w #1,d1;bra / subq.w #1,d0 / join $010396
+The recompiler only knew uniform Duff's devices and dc.w offset tables, so these were
+INTERIOR_UNRESOLVED -> hybrid_jmp_interpret -> floor capsule declined -> step skipped.
+10 sites: $010384 $010680 $011660 $011DC4 $011E2E $020022 $020130 $02066E $021526 $021D8A.
+Fix: probe_stub_table_rom() in m68k-recomp-core profiles/genesis/code_generator.c
+(seeding at scan time + in-function switch at codegen). Audit: INTERIOR_UNRESOLVED 7 -> 0,
+in_function_switch 0 -> 10. Saved as patches/m68k-recomp-core-stub-jump-tables.patch
+(applied in the submodule working copy; upstream candidate for mstan/m68k-recomp-core).
+Evidence before this rebuild copied to evidence/2026-11-22/.
+
+## Top-left panel garbage + lost control after the stub-table fix (Nov 22)
+BlastEm fine; GENESIS_FORCE_INTERP=1 fine -> a generated-C divergence (not the runner),
+in code that only started running natively once the step jumps stopped being skipped.
+Bisect tool: every routine entry is a game_hook site (game.toml widescreen_site list,
+956 entries), and wotes_spec.c's instruction_hook runs routines selected by
+WOTES_INTERP (all | lo-hi | list) on m68k_interp_run_framed(). Halve the range until
+the one bad routine is left.
+Interpreter coverage runs: coverage/*.txt (5 sessions Nov 22, 19,039 PCs; 2,696 executed
+PCs in 83 runs not in generated C -> next discovery round).
+
+Bisect (cave: panel + control):
+ 1 all -> OK
+ 2 00FE00-0FFFFF -> OK (panel/control fine; music missing in this mode, note for later)
+ 3 01ED00-0FFFFF -> OK (music missing, sound effects OK)
+ 4 0208A0-0FFFFF -> OK, music fine (music starts after walking a bit; earlier "missing music" was probably that)
+ 5 021400-0FFFFF -> BROKEN  => bad routine in 0208A0-0213FF (38)
+ 6 020E90-0213FF -> BROKEN  => bad routine in 0208A0-020E8F (19)
+ 7 020B70-020E8F -> BROKEN  => in 0208A0-020B6F (9): 0208D2 0208E2 020938 02093C 020948 020950 020974 02098C 020AD0
+    (note: interpreting a routine also interprets everything it calls, so the result is a routine whose subtree holds the bad C)
+ 8 020940-020B6F -> BROKEN  => in 0208D2 0208E2 020938 02093C
+ !! tests 5-9 unreliable: the hook could fire on a split-routine piece and drop g_split_sp_popped. Hook now only acts when entered by a real BSR/JSR. Redo from test 5.
+
+Re-bisect with call-entry-only hooks:
+ 5r 021400+ BROKEN; 6r 020E90-0213FF BROKEN; 7r 020B70-020E8F BROKEN; 8r 0208D2 only BROKEN
+ => likely a shared helper called from several places >= 0208A0. Bisect by helper address:
+ 9r 000000-02089F WORKS
+ 10r 00D390-02089F WORKS
+ 11r 013F00-02089F WORKS
+ 12r 01EDC0-02089F WORKS
+ 13r 01FED0-02089F WORKS (33 left; suspects: stub-table routines 01FFE8 020090 020650)
+ 14r 01FFE8,020090,020650 BROKEN (stub-table fix cleared); 15r 01FED0-01FFE7 BROKEN
+ => bad routine in 020294-020880; ROM read found it:
+FOUND (Nov 22): $020294 (adjacency check by facing) does MOVEM d2-d3/a2,-(sp) (-12),
+then JMP 2(pc,d0.w) into a BRA.S table ($0202E0..$0202E6, each made a function).
+Codegen's hybrid_jmp_interpret path did NOT carry the path-local _sp_popped (-12) into
+g_split_sp_popped (ordinary split tail calls do). The shared tail $020334 (MOVEM pop
++12, RTS) is a "capturing exit" candidate, saw +12 and set g_rte_pending = 3 ->
+3 caller return levels skipped -> panel garbage + lost control.
+Fix: carry g_split_sp_popped += _sp_popped before hybrid_jmp_interpret (switch default
+and plain fallback) when the function tracks _sp_popped; reset it after the handler
+chain returns. 16 sites. Both engine fixes now in patches/m68k-recomp-core-wotes-fixes.patch
+(stub tables + this carry). Upstream candidates.

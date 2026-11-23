@@ -1,0 +1,5 @@
+# ===== Step 12: rebuild with the stack-carry fix (recompiler changed: takes a few minutes) =====
+cd ~/Projects/WarriorsOfTheEternalSunRecomp
+cmake --build build --target WotESRecomp
+# ===== Step 13: test in normal (native) mode, no WOTES_INTERP =====
+./build/WotESRecomp game/wotes.bin

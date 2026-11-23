@@ -1,0 +1,28 @@
+# Build output (generated C lives only in the build tree)
+build/
+build-*/
+_to_delete/
+
+# ROMs / dumps: never commit
+*.bin
+*.gen
+*.md.rom
+*.smd
+
+# Runtime / debug artifacts
+*.srm
+*.wav
+*.png
+*.log
+*.ram
+*.vram
+settings.ini
+rom.cfg
+debug.ini
+dispatch_misses*.toml
+floor_*.toml
+interior_label_misses*.toml
+__pycache__/
+
+# Raw interpreter coverage runs (merged into game/ when used)
+coverage/
