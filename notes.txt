@@ -124,3 +124,16 @@ of bare BRA.S entries -> probe_stub_table_rom handles bare-branch tables (in_fun
 Result (regen here): functions 958 -> 1060, native instructions 25,182 -> 28,508
 (gate tools/compare_native.py: lost 0), dispatch audit INTERIOR_UNRESOLVED 0.
 Hook list (WOTES_INTERP) regenerated: 1058 routines.
+
+Round 1 play (Nov 23, ~50 min to the Azcan cavern): unsafe 0, interior 0 ($0061EC gone), dispatch 0, floor 74 (was 307). Evidence saved to evidence/2026-11-23-r1/.
+
+## Phase 1 coverage round 2 (Nov 23)
+Round-1 play had only 3 real floor misses (the other 71 floor entries were their subtrees):
+$01FD5C, $01FEE2 (inline LAST entries of BRA tables: $01FD4C 3x BRA.S + EXG/NEG/RTS,
+$01FEBE 8x BRA.W + MOVEQ...; same shape as graveyard $00D106/$00D114) and $022BE4
+(function pointer: MOVE.L #$022BE4,$FF801A at $022BD6, called via JSR (A0) at $00B99E).
+New interpreter run coverage/2026-11-23-0117.txt (17,288 PCs; total 19,783).
+Codegen: bare-BRA tables now include a trailing inline non-branch entry (seeded at scan time,
+promoted to routines when the BRAs are already routines). game/wotes_manual.discovery.toml
+documents $022BE4, $01FD5C, $01FEE2. Regen: functions 1060 -> 1070, native +94, lost 0,
+INTERIOR_UNRESOLVED 0; $00D114 (graveyard) is native now too. Hooks: 1068.

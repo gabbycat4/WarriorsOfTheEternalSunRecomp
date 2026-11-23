@@ -1,7 +1,7 @@
-# ===== Step 17: coverage round 1 (recompiler + config changed: full regen, a few minutes) =====
+# ===== Step 18: coverage round 2 (recompiler + config changed: full regen) =====
 cd ~/Projects/WarriorsOfTheEternalSunRecomp
 cmake --build build --target WotESRecomp
 ./build/WotESRecomp game/wotes.bin
-# Play the same kinds of things as before (town, cave, graveyard, battles, camp,
-# shops). If all is well, commit:
-#   git add . && git commit -m "Coverage round 1: 91 floor roots, bare BRA tables"
+# Play (normal mode), especially: dungeons/caves (turning), the graveyard graves,
+# the Azcan cavern area. If all is well:
+#   git add . && git commit -m "Coverage round 2: branch tables with inline last entry, \$022BE4"

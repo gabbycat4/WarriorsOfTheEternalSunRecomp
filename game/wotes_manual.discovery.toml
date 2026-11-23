@@ -1,0 +1,18 @@
+# Hand-validated routine roots (each with its proof). Non-recursive late_extra.
+[functions]
+late_extra = [
+  # $022BE4: stored as a function pointer by MOVE.L #$00022BE4,$FF801A at $022BD6
+  # and called through JSR (A0) from the controller routine ($00B99E) while
+  # $FF8020 is set. Preceded by RTS at $022BE2; decodes cleanly (tst.w $801E ...).
+  # Floor miss in round-1 play (Azcan cavern area), not yet seen by an interpreter run.
+  0x022BE4,
+  # Inline last entries of branch tables whose BRA entries are already separate
+  # routines, so the JMP dispatches by address (function_entry) and the inline
+  # entry missed to the floor every time:
+  # $01FD5C: andi.w #3,d2 / add.w d2,d2 / jmp 2(pc,d2.w) at $01FD4C ->
+  #   BRA.S x3 ($01FD56-$01FD5A), index 3 = EXG d0,d1 / NEG.W d1 / RTS at $01FD5C.
+  0x01FD5C,
+  # $01FEE2: jmp 2(pc,d0.w) at $01FEBE -> BRA.W x8 ($01FEC2-$01FEDE),
+  #   index 32 = MOVEQ #2,d0 ... at $01FEE2 (floor miss, round-1 play).
+  0x01FEE2,
+]
