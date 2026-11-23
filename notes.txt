@@ -137,3 +137,11 @@ Codegen: bare-BRA tables now include a trailing inline non-branch entry (seeded 
 promoted to routines when the BRAs are already routines). game/wotes_manual.discovery.toml
 documents $022BE4, $01FD5C, $01FEE2. Regen: functions 1060 -> 1070, native +94, lost 0,
 INTERIOR_UNRESOLVED 0; $00D114 (graveyard) is native now too. Hooks: 1068.
+
+## Phase 1 coverage round 3 (Nov 23)
+Round-2 play (~60 min, past the Azcan cavern): unsafe 0, interior 0, dispatch 0; 6 real floor
+misses. fold_floor.py accepted $012700, $01635C (+ $015960 under it). Pointer-proven by hand
+(game/wotes_manual.discovery.toml): handler table at $00A448 ($A4C0,$A4FE,$A534,$A49C; called via
+JSR (A0) at $00A424) and script-table code pointers $022C88, $022D0C.
+Regen: functions 1070 -> 1087, native 28,602 -> 29,115 (+513, lost 0), INTERIOR 0. Hooks 1085.
+Evidence: evidence/2026-11-23-r2/.

@@ -94,4 +94,7 @@ late_extra = [
   0x021762,  # floor_coverage.toml: session 2 frame 48881
   0x021768,  # floor_coverage.toml: session 2 frame 55598
   0x02176E,  # floor_coverage.toml: session 2 frame 47326
+  0x012700,  # floor_coverage.toml: session 2 frame 6628
+  0x015960,  # floor_coverage.toml: session 2 frame 6621 floor_entry $01635C
+  0x01635C,  # floor_coverage.toml: session 2 frame 6621
 ]

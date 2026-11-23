@@ -15,4 +15,12 @@ late_extra = [
   # $01FEE2: jmp 2(pc,d0.w) at $01FEBE -> BRA.W x8 ($01FEC2-$01FEDE),
   #   index 32 = MOVEQ #2,d0 ... at $01FEE2 (floor miss, round-1 play).
   0x01FEE2,
+  # Round 3: handler table of longs at $00A448 = $A4C0,$A4E2,$A4FE,$A534,$A49C,
+  # called through JSR (A0) at $00A424. $A4E2 was already a routine; the rest
+  # each decode cleanly ($A4C0/$A4FE/$A534 were floor misses in round-2 play).
+  0x00A4C0, 0x00A4FE, 0x00A534, 0x00A49C,
+  # Code pointers inside the script table around $022B9C ($00022C88) and
+  # $022BC2 ($00022D0C); each starts right after an RTS and decodes cleanly
+  # ($022C88 was a floor miss in round-2 play).
+  0x022C88, 0x022D0C,
 ]
