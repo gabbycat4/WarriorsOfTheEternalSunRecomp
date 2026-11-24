@@ -206,3 +206,57 @@ Future engine change, inside-out: commit+push in segagenesisrecomp/external/m68k
 (branch wotes) -> in segagenesisrecomp: git add external/m68k-recomp-core (+ runner files),
 commit, push fork wotes -> in the game repo: git add segagenesisrecomp, commit, push.
 patches/*.patch are now only a record. Later: pull requests to mstan from the wotes branches.
+
+## Phase 3: presentation (started Nov 24)
+The engine ALREADY has host-only interpolation for cartridge games (runner/main.c ~4320):
+a display clock independent of the 59.94 Hz guest clock issues 2-4 pictures per tick at
+fractional phases, VSync off, late pictures dropped (never queued), GENESIS_PRESENT_TRACE=file
+logs every picture (frame, count, phase, interpolated, perf counter, image hash). It is on
+only when g_game_spec.video->interpolate exists and settings "High refresh rate" (in-game menu
+Esc -> Mods; settings.ini [video] presentation_rate = 120 | 144 | -1 display rate) is set.
+Capture: GameVideo.presentation_capture gets every completed row with GVDPRasterRow layers
+(plane A/B, sprites, priorities, host palette) -> the base for Phase 4 in-betweens.
+So our Phase 3 = wire a WotES adapter (game/wotes_video.c, GameSpec.video) and measure pacing
+at 240 before deciding whether the second core / pinning from nesrecomp dd2-240hz is needed.
+Step 1: adapter with interpolate() returning 0 (pictures repeat) -> pacing test.
+Phase 3 result (measurements/pacing-1.csv + .stderr.txt, Nov 24, 240 Hz "Display refresh rate",
+pictures repeating): 19,300 pictures over 4,820 ticks = 4.004/tick (4 x 4800, 5 x 20);
+interval median 4.167 ms, p99 4.218, max 4.429; 0 intervals > 6.25 ms (no skipped/late
+pictures). => The engine's single-thread presentation is enough at 240 Hz; no second core /
+pinning needed (native code is light). Watch drawing cost when Phase 4 draws real in-betweens.
+Phase 4 step 4.1 (Nov 24): game/wotes_video.c keeps, per completed frame, a COPY of the VDP state
+(captured at the last visible row) + the real picture + extra host colours. interpolate() renders
+the copy with the engine's own gvdp_render_scanline, palette rebuilt like genesis_machine.c
+colour_cb (0-63 normal, 64-127 shadow, 128-191 highlight via genesis_dac, host colours from
+GVDP_HOST_PALETTE_BASE), compares with the real picture and shows ours only on an exact match.
+No motion yet. WOTES_VIDEO_LOG=1 logs a self-check line once a second. Safe with HD: the runner
+never calls interpolate() for the HD texture.
+Phase 4.1 result (measurements/selfcheck-1.*): re-render == real picture in 36,025/36,033
+pictures (the 8 differing were all in the first second, startup); pacing median 4.166 ms,
+max 5.94 ms, 0 late. Re-render approach is pixel-exact and cheap enough.
+Phase 4.2 (Nov 24): motion in game/wotes_video.c. Camera = plane scroll interpolated prev->latest
+(hscroll table entries per mode 0/2/3, VSRAM full/column; >32 px = cut). Sprites = tracked
+objects in WORLD coords (screen + camera: wx = sx - hs, wy = sy + vs), matched by tile group +
+palette, then palette + size (animation frames), nearest within 48 px. Each object learns its
+step period (median of last 4 gaps, 1..12): walkers ease over 1 frame, battle hops glide over
+their 9 frames (up to one step of visual delay, input unaffected). Jumps > 16 px in one frame
+(side-panel arrow 48 px between party boxes, teleports) = cuts. Self-check once a second
+(unmoved render == real), WOTES_VIDEO_MOTION=0 = self-check only. Output is native resolution
+(whole pixels): the map's 1 px/frame can't get finer (half pixels need a 2x path later).
+Offline replay tools/glide_replay.py (same rules, 4 pictures/frame):
+  battle-1 3150-9200: moves of 4+ px 983 per real frame -> 0 per picture (all steps 0/1/2 px)
+  worldmap-1 960-3360: 21 -> 0
+
+== Phase 4.3: quarter-pixel in-between pictures (2026-11-24) ==
+Engine (segagenesisrecomp fork, not yet committed): GameVideo gains
+presentation_scale() and interpolate_scaled(); main.c high_refresh loop draws
+those into its own w*S x h*S nearest-scaled texture (colour LUT, trace hash
+sampled 1 px per native block, png snap all handle the scaled size).
+Adapter (game/wotes_video.c): camera offset and sprite positions rounded to
+1/S px; planes captured once at the whole-pixel camera, sprites captured per
+fraction group (max 4, link-order priority between groups), layers shifted
+0/1 native px per sub-column/sub-row, composed with gvdp_compose_span; window
+plane unshifted. x=0 mask sprites never moved (native path too).
+Env: WOTES_VIDEO_SCALE=2..4 (default 4, 1 = off). Log line adds timing,
+sprite groups, fallbacks and a phase-1 "4x-vs-real" exactness check.
+Test: Step 26 -> measurements/quarter-1.*

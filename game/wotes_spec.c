@@ -18,6 +18,7 @@
 #include "genesis_runtime.h"
 
 #include "m68k_interp.h"
+#include "wotes_video.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -132,6 +133,7 @@ static int wotes_instruction_hook(uint32_t pc)
 }
 
 const GameSpec g_game_spec = {
+    .video                  = &wotes_video,   /* high refresh rate (Phase 3/4) */
     .display_name           = "Warriors of the Eternal Sun",
     .short_name             = "WOTES",
 

@@ -1,38 +1,13 @@
-# ===== Step 22: GitHub. Run ONE block at a time and send me a screenshot after each. =====
-
-# --- 22a: save the Phase 2 work in your game repo (motion log etc.) ---
+# ===== Step 26: Phase 4.3 quarter-pixel pictures (engine + game code changed: rebuild) =====
+# The build takes a little longer than last time, because the engine changed too.
 cd ~/Projects/WarriorsOfTheEternalSunRecomp
-git add .gitignore CMakeLists.txt STEPS.txt notes.txt game/game.toml game/wotes_spec.c game/wotes_motion.c
-git commit -m "Phase 2: motion log (WOTES_MOTION_LOG) and measurements notes"
-
-# --- 22b: create your three forks on GitHub (copies under gabbycat4, nothing downloaded) ---
-gh repo fork mstan/m68k-recomp-core --clone=false
-gh repo fork mstan/z80-recomp-core --clone=false
-gh repo fork mstan/segagenesisrecomp --clone=false
-
-# --- 22c: recompiler core: put the two recompiler fixes on branch "wotes" in your fork ---
-cd ~/Projects/WarriorsOfTheEternalSunRecomp/segagenesisrecomp/external/m68k-recomp-core
-git remote add fork https://github.com/gabbycat4/m68k-recomp-core.git
-git switch -c wotes
-git add profiles/genesis/code_generator.c
-git commit -m "Genesis codegen: stub/branch jump tables as in-function switches; carry split stack delta through computed JMPs"
-git push -u fork wotes
-
-# --- 22d: engine: put the runtime fixes on branch "wotes" in your fork ---
-cd ~/Projects/WarriorsOfTheEternalSunRecomp/segagenesisrecomp
-git remote add fork https://github.com/gabbycat4/segagenesisrecomp.git
-git switch -c wotes
-git add runner/glue.c runner/game_spec.h runner/video/genesis_machine.c external/m68k-recomp-core
-git commit -m "Runner: floor return slot for computed-JMP tails; opt-in V-int controller latch; m68k core with WotES codegen fixes"
-git push -u fork wotes
-
-# --- 22e: game repo: use your engine fork (branch wotes) instead of mstan's ---
-cd ~/Projects/WarriorsOfTheEternalSunRecomp
-git config -f .gitmodules submodule.segagenesisrecomp.url https://github.com/gabbycat4/segagenesisrecomp.git
-git config -f .gitmodules submodule.segagenesisrecomp.branch wotes
-git submodule sync
-git add .gitmodules segagenesisrecomp
-git commit -m "Engine: gabbycat4/segagenesisrecomp branch wotes (WotES fixes)"
-
-# --- 22f: create the game repo on GitHub (private for now) and upload it ---
-gh repo create gabbycat4/WarriorsOfTheEternalSunRecomp --private --source=. --remote=origin --push
+cmake --build build --target WotESRecomp
+env WOTES_VIDEO_LOG=1 GENESIS_PRESENT_TRACE=measurements/quarter-1.csv mangohud ./build/WotESRecomp game/wotes.bin 2> measurements/quarter-1.stderr.txt
+# Play ~3 minutes, mostly the WORLD MAP (walk in long straight lines, then
+# diagonals), plus one battle and a dungeon. Close normally.
+# Watch: is world-map scrolling smooth now? Is the side panel still steady?
+# Any flicker or seams at sprite edges? Say "done" with what you saw.
+#
+# To compare with the whole-pixel version from Step 25 (same everything,
+# only the 4x drawing off):
+#   env WOTES_VIDEO_SCALE=1 mangohud ./build/WotESRecomp game/wotes.bin

@@ -1,0 +1,41 @@
+WotES recomp: where we are (read this first in a new chat)
+==========================================================
+Project: ~/Projects/WarriorsOfTheEternalSunRecomp (Genesis "Warriors of the
+Eternal Sun" -> native PC via mstan's segagenesisrecomp). Plan file:
+~/Projects/WarriorsOfTheEternalSun_recomp_plan.txt. Full history of every
+finding: notes.txt (read the last sections). The next thing to run: STEPS.txt.
+
+How we work
+- One step at a time. I (the user) run builds, the game and all git commands.
+- Claude writes STEPS.txt. I use the fish shell, so: no heredocs, and comment
+  lines start with #. Every command block starts with cd ~/Projects/...
+- Put mangohud in front of ./build/WotESRecomp in play commands.
+- Never commit the ROM (game/wotes.bin) or generated files.
+- I'm very sensitive to motion blur and uneven scrolling (eye strain).
+  That's the whole point of Phase 4.
+- I work night shifts.
+
+Done
+- Phase 0-1: game plays cleanly (1087 native routines, engine fixes pushed to
+  the gabbycat4 forks, wotes branches).
+- Phase 2: motion measured. World map: camera 1 px/frame. Battles: 8 px hops
+  every 9 frames.
+- Phase 3: 240 Hz pacing works (Esc -> Mods -> High refresh rate).
+- Phase 4.2: in-between pictures with motion. Battles are much smoother.
+- Phase 4.3 (code written, NOT TESTED YET): quarter-pixel (4x) in-between
+  pictures, so world-map scrolling should finally be smooth.
+  Engine: segagenesisrecomp/runner/game_video.h + main.c
+  (interpolate_scaled). Game: game/wotes_video.c. Off switch:
+  WOTES_VIDEO_SCALE=1.
+
+Next
+1. Run Step 26 in STEPS.txt (rebuild, play the world map ~3 min). Report:
+   smooth? flicker or seams at sprite edges? Then Claude reads
+   measurements/quarter-1.stderr.txt (timing, "4x-vs-real" exactness) and
+   measurements/quarter-1.csv (late pictures).
+2. Dither blending comfort option (mountain shading shimmer).
+3. Eased battle camera (the enemy <-> party swing is too fast and blurry).
+4. Remove the pre-battle slowdown stutter (GameSpec main_cpu_divisor).
+5. Look into the 26 late pictures / 57 ms gap from motion-1.csv.
+Later: Phase 5 comfort settings tab + README; maybe pull requests to mstan.
+Reminder: turn on GitHub 2FA before Nov 29.
