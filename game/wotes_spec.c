@@ -19,6 +19,8 @@
 
 #include "m68k_interp.h"
 #include "wotes_video.h"
+#include "genesis_machine.h"
+#include "genesis_bus.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -106,11 +108,85 @@ void wotes_motion_frame(uint64_t frame);  /* wotes_motion.c */
 
 static int s_headroom = -1;                 /* CPU headroom (Step 30/31), set on first query */
 static unsigned long long s_false_late;     /* Step 33: false "late" flags cleared */
+/* Step 37: dash. Hold B with a direction on the world map or in town: the main
+ * loop ($000608, the map/town loop; dungeons and battles run their own) gets
+ * one extra pass in the same frame, so walking, followers and the camera move
+ * twice as far per frame. The extra pass skips the frame wait, which marks it
+ * "late" ($FFA915); the encounter hook below treats it as on time, so random
+ * encounters work per step as usual. WOTES_DASH=0 = off. */
+static int      s_dash = -1;
+static unsigned s_dash_frame = 0x100;      /* frame counter value of the last extra pass */
+static int      s_dash_extra;              /* the pass now running is an extra one */
+static unsigned long long s_dash_passes;
+
+/* Step 38: fast travel to the town. Hold A + C (no direction) for one second
+ * on the world map: the party is put just inside the town's north gate with
+ * the game's own "build the map view" routine $000888 (the one used after a
+ * load and by scripted teleports, e.g. $0226DA passes D0 = $09380C94): D0 =
+ * camera x << 16 | y; it draws both planes there and puts the party at
+ * camera + $60. The town is part of the world map (music zone
+ * $FFA91B: $12 town, $00 outside); its gate is at x $0BE6-$0BEA, y ~$0D40.
+ * WOTES_FAST_TRAVEL=0 off; WOTES_TOWN_X / WOTES_TOWN_Y override the spot. */
+static int      s_ft = -1, s_ft_latched;
+static unsigned s_ft_hold, s_ft_x = 0x0BE9, s_ft_y = 0x0DD0;
+
+static void wotes_fast_travel(void)
+{
+    uint32_t d[8], a[8];
+    memcpy(d, g_cpu.D, sizeof d); memcpy(a, g_cpu.A, sizeof a);
+    uint16_t cx = (uint16_t)(s_ft_x - 0x60u), cy = (uint16_t)(s_ft_y - 0x60u);
+    fprintf(stderr, "[WOTES] fast travel: party (%04X,%04X) -> (%04X,%04X)\n",
+            m68k_read16(0xFF914Cu), m68k_read16(0xFF914Eu), s_ft_x, s_ft_y);
+    /* $000888 takes the new CAMERA position in D0 (x << 16 | y): $0009B8 stores
+     * it into each plane's camera record, $000988 puts the party at camera +
+     * $60 (Step 38's first try left D0 unset: a garbage position = wrong map). */
+    g_cpu.D[0] = (uint32_t)cx << 16 | cy;
+    recomp_push_return(0x000608u);                             /* like a JSR from the loop top */
+    int saved = g_split_sp_popped; g_split_sp_popped = 0;
+    recomp_call_addr(0x000888u);
+    g_split_sp_popped = saved;
+    memcpy(g_cpu.D, d, sizeof d); memcpy(g_cpu.A, a, sizeof a);  /* the loop's registers, stack as before */
+}
 
 static int wotes_instruction_hook(uint32_t pc)
 {
     /* Main-loop pass counter for the motion log (never replaces code). */
-    if (pc == 0x000608u) { wotes_motion_main_loop_pass(); return 0; }
+    if (pc == 0x000608u) {
+        wotes_motion_main_loop_pass();
+        if (s_dash < 0) {
+            const char *e = getenv("WOTES_DASH");
+            s_dash = !(e && *e == '0');
+            fprintf(stderr, "[WOTES] dash (hold B while walking on the map / in town) %s\n", s_dash ? "on" : "off");
+        }
+        if (s_ft < 0) {
+            const char *e = getenv("WOTES_FAST_TRAVEL");
+            s_ft = !(e && *e == '0');
+            if ((e = getenv("WOTES_TOWN_X")) && *e) s_ft_x = (unsigned)strtoul(e, NULL, 16);
+            if ((e = getenv("WOTES_TOWN_Y")) && *e) s_ft_y = (unsigned)strtoul(e, NULL, 16);
+            fprintf(stderr, "[WOTES] fast travel (hold A+C for 1 s on the map) %s, town spot (%04X,%04X)\n",
+                    s_ft ? "on" : "off", s_ft_x, s_ft_y);
+        }
+        if (s_ft) {
+            uint16_t pad = g_machine.bus.pad[0];
+            int combo = (pad & (GPAD_A | GPAD_C)) == (GPAD_A | GPAD_C) && !(pad & 0x0Fu);
+            if (!combo) { s_ft_hold = 0; s_ft_latched = 0; }
+            else if (!s_ft_latched && ++s_ft_hold >= 60) { s_ft_latched = 1; wotes_fast_travel(); }
+        }
+        s_dash_extra = 0;
+        if (s_dash && s_headroom > 1) {
+            uint16_t pad = g_machine.bus.pad[0];
+            uint8_t fc = m68k_read8(0xFF8004u);
+            /* The pass that just ended started in this same frame and no extra
+             * pass ran yet this frame: run the next pass now, without waiting. */
+            if ((pad & GPAD_B) && (pad & 0x0Fu) && (uint8_t)g_cpu.D[3] == fc && s_dash_frame != fc) {
+                g_cpu.D[3] = (g_cpu.D[3] & 0xFFFFFF00u) | (uint8_t)(fc ^ 0x01u);
+                s_dash_frame = fc; s_dash_extra = 1;
+                if (++s_dash_passes == 1 || s_dash_passes % 600 == 0)
+                    fprintf(stderr, "[WOTES] dash: %llu extra passes so far\n", s_dash_passes);
+            }
+        }
+        return 0;
+    }
     /* Step 33: random battles with CPU headroom. The main loop ($0006E2-$000708)
      * marks a pass "late" ($FFA915 = $FF) if a new frame began, or if the beam
      * is on lines 0-15, or in the active display below line 112. The encounter
@@ -122,7 +198,7 @@ static int wotes_instruction_hook(uint32_t pc)
     if (pc == 0x012CD8u) {
         if (s_headroom > 1 && m68k_read32(g_cpu.A[7]) == 0x000712u &&
             m68k_read8(0xFFA915u) != 0 && (uint8_t)g_cpu.D[3] == m68k_read8(0xFF8004u) &&
-            (m68k_read16(0xC00008u) >> 8) < 0x10u) {
+            (s_dash_extra || (m68k_read16(0xC00008u) >> 8) < 0x10u)) {
             m68k_write8(0xFFA915u, 0);
             if (++s_false_late <= 3 || s_false_late % 500 == 0)
                 fprintf(stderr, "[WOTES] encounter check: false \"late\" pass cleared (%llu so far)\n", s_false_late);

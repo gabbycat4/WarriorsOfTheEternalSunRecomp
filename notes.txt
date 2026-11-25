@@ -411,3 +411,34 @@ frames, forgotten on cuts / missed frames). Margin pixels come from it first, th
 previous-camera capture, then backdrop. Log adds "edge px from map memory".
 Step 35 result (step35.*, user: "I think it's perfect"): layer checks 0/203 failed, battle trail up
 to 51.6 px (within the 60 px clamp), random battles normal. Phase 4 motion work done.
+
+Phase 6 (user requests, Nov 25): dash (hold B) on world map + town, fast travel to the (only) town.
+Party record: leader at $FF9130 (name "..THONY"), position x,y words at $FF914C/$FF914E (RAM scan of
+worldmap-1: 98% lockstep with the camera); followers at +$96: $91E2, $9278, $930E. func_000988
+places all four at ((A0)+$60, (A0+2)+$60): a spawn/teleport routine (for fast travel later).
+Step 37 dash (game/wotes_spec.c, hook $000608, needs headroom > 1): B + a direction held, previous
+pass started in this frame, no extra pass yet this frame -> D3 low byte set != $FF8004 so the loop
+skips its frame wait and runs a second pass in the same frame (2x walking, followers, camera on the
+map/town loop only; dungeons/battles have their own loops). Extra passes are treated as on time
+by the encounter hook (else $A915=$FF would cancel encounters). WOTES_DASH=0 off.
+Fast travel plan: record town entry/exit (step37.log) to find the area id, the town entrance
+position and the area-load routine; trigger from the Esc -> Mods menu while on the world map.
+Step 37 result: dash works (user: "Dash worked great!"). Town entry recording step37b.log:
+the town is part of the world map (no area load, no camera cut); music zone $FFA91B ($12 town,
+$00 outside, $FF while changing) switches at the north gate x $0BE6-$0BEA, y ~$0D23-$0DBA (town
+south). Camera structs: plane A $FF8648 (x,y), plane B $FF8736; party = camera + $60 (town save:
+party (0A06,0F91), camera (09A6,0F31)); $85B8/$85BC = scroll registers.
+func_000888 = build the map view: plane structs, $0009B8 draws each plane from its camera,
+$000988 places the 4 party members at the plane-B camera + $60, then $00692C, $000C3A, $00BAF6,
+$00BB90, $00BB80, $004EDC. Called after loads/battles (7 callers).
+Step 38 fast travel (game/wotes_spec.c hook $000608): hold A+C (no direction) 60 passes -> both
+plane cameras = town spot - $60, call $000888 like a JSR (registers saved/restored), town spot
+(0BE9,0DD0) just inside the north gate. WOTES_FAST_TRAVEL=0 off, WOTES_TOWN_X/Y (hex) override.
+Step 38 result: BROKEN - user screenshot: odd map, one character, 3 grey portraits. step38.log: party
+ended at (0060,366C), camera (0000,360C), music $15. Cause: $000888 takes D0 = new camera
+position (x << 16 | y; $0009B8 does move.l d0,(a0) into the camera record; $0226DA calls it with
+D0 = $09380C94, $022C88 with D0 = ($FF8C82)). The hook left D0 = whatever the loop had.
+Fix (Step 39): D0 = (town spot - $60) packed; no direct camera writes needed.
+Step 39 result (step39.*, user: "everything seemed fine"): 3 fast travels, each landed exactly on
+(0BE9,0DD0) with camera (0B89,0D70); random battle and leaving/re-entering town fine. (Grey
+portraits in Step 38's screenshot were dead party members in that save, not the bug.) Phase 6 done.

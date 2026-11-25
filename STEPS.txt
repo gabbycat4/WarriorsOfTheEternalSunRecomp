@@ -1,5 +1,5 @@
-# ===== Step 36: commit Steps 30-35 (tested) =====
+# ===== Step 40: commit dash + fast travel (tested) =====
 cd ~/Projects/WarriorsOfTheEternalSunRecomp
-git add game/wotes_video.c game/wotes_spec.c game/wotes_motion.c HANDOFF.txt notes.txt STEPS.txt
-git commit -m "4x CPU headroom (no lag frames) with encounter-check fix, party smoothing, averaged battle camera with map memory"
+git add game/wotes_spec.c HANDOFF.txt notes.txt STEPS.txt
+git commit -m "Dash (hold B on map/town) and fast travel to the town (hold A+C on the world map)"
 git push

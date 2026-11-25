@@ -50,7 +50,8 @@ Next
    WOTES_CPU_HEADROOM=1 = original timing).
 2. Steps 33-35 DONE (user: "perfect"): random battles back, diagonal party
    smoothing, averaged battle camera + map memory, all on by default.
-3. Next: Phase 5 - comfort settings tab (headroom, party smoothing, battle
-   camera, dither blending as menu options) + README.
-Later: Phase 5 comfort settings tab + README; maybe pull requests to mstan.
-
+3. Phase 6 DONE: dash (hold B while walking, map + town) and fast travel
+   (hold A+C 1 s standing still on the world map -> inside the town's north
+   gate), both in game/wotes_spec.c hooks; WOTES_DASH=0 / WOTES_FAST_TRAVEL=0.
+4. Optional, only if wanted: Phase 5 comfort settings tab + README (user is
+   happy with the defaults; not needed for personal use).
