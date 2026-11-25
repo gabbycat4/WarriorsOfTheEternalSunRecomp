@@ -32,6 +32,13 @@
  * quarter-pixel fraction; then layers are shifted by 0 or 1 native pixel per
  * sub-pixel column/row and composed with the VDP's own priority rules
  * (gvdp_compose_span). The window plane (side panel) never moves.
+ * Step 4.4: speed + comfort. Layer captures are cached per real frame (a
+ * sprite group is re-captured only when its members' whole-pixel positions
+ * change, planes only when the whole-pixel camera changes), and rows without a
+ * group's sprites ignore that group's fraction, so 240 Hz pictures stay well
+ * inside 4.17 ms. Dither blending (WOTES_DITHER_BLEND=0 = off): 1-px checker /
+ * stripe patterns in the planes (mountain shading) are shown as their average
+ * colour, as a TV showed them, so scrolling doesn't make them shimmer.
  * WOTES_VIDEO_LOG=1 logs a line once a second; WOTES_VIDEO_MOTION=0 disables
  * motion (pure self-check mode).
  * Never touches guest state; never runs when HD presentation is active
@@ -43,6 +50,7 @@
 #include "genesis_vdp.h"
 #include "genesis_dac.h"
 #include "genesis_vdp_compose.h"
+#include "png_write.h"
 
 #include <limits.h>
 #include <math.h>
@@ -62,6 +70,11 @@ typedef struct {
     uint32_t host[GVDP_HOST_PALETTE_SIZE];      /* extra host colours, if any */
     int      width, height, complete;
     unsigned serial;
+    /* Step 4.5: the real frame's layers, row by row (GPU layer path). */
+    uint8_t  ra[WV_H][WV_W], rb[WV_H][WV_W];    /* plane A (window included) / plane B bytes */
+    uint8_t  rf[WV_H][WV_W];                    /* 1 = a sprite pixel is shown here */
+    uint8_t  rbd[WV_H];                         /* backdrop index */
+    int      raster_ok;                         /* every row captured, no shadow mode */
 } WVFrame;
 
 static int      s_enabled;
@@ -85,7 +98,7 @@ static void wotes_presentation_configure(int enabled)
     s_enabled = enabled;
     wv_init();
     s_latest = -1;
-    fprintf(stderr, "[WOTES-VIDEO] high refresh rate %s (step 4.3: motion, quarter-pixel pictures)\n",
+    fprintf(stderr, "[WOTES-VIDEO] high refresh rate %s (step 4.5: GPU layers; 4x CPU pictures as fallback)\n",
             enabled ? "ON" : "off");
 }
 
@@ -104,9 +117,17 @@ static void wotes_presentation_capture(const struct GVDP *vdp, int line,
         f->width = width;
         memset(f->host, 0, sizeof f->host);
         if (raster) memcpy(f->host, raster->host_palette, sizeof f->host);
+        f->raster_ok = 1;
     }
     if (width != f->width || width > WV_W) { f->width = -1; return; }   /* unsupported */
     memcpy(&f->real[(size_t)line * WV_W], image, (size_t)width * sizeof *image);
+    if (raster && (int)raster->width == width && !raster->start && (int)raster->count == width &&
+        raster->display && !raster->private_planes && !raster->diagnostic && !raster->shadow_mode) {
+        memcpy(f->ra[line], raster->plane_a, (size_t)width);
+        memcpy(f->rb[line], raster->plane_b, (size_t)width);
+        for (int x = 0; x < width; x++) f->rf[line][x] = raster->opaque[x] != 0;
+        f->rbd[line] = raster->backdrop;
+    } else f->raster_ok = 0;
     int h = gvdp_output_height(vdp);
     if (line == h - 1 && f->width > 0) {
         f->vdp = *vdp;              /* the state this frame was drawn from */
@@ -397,11 +418,76 @@ static int wotes_interpolate(double phase, uint32_t *image, int stride, int heig
 typedef struct { int fx, fy, rank; } WVGroup;   /* sprites sharing one sub-pixel fraction */
 
 static int      s_scale = -1;
-static uint8_t  s_pa[WV_H][WV_W], s_pb[WV_H][WV_W];            /* planes at the whole-pixel camera */
-static uint8_t  s_gs[WV_MAX_GRP][WV_H][WV_W];                  /* sprite colour per group */
-static uint8_t  s_gf[WV_MAX_GRP][WV_H][WV_W];                  /* 1 opaque, 2 high, 4 shadow op, 8 highlight op */
-static uint8_t  s_bd[WV_H], s_sm[WV_H];
 static GVDPRasterRow s_row;
+
+/* Step 4.4: layer cache. Within one real frame a sprite group's layer only
+ * changes when its members' whole-pixel positions change, and the planes only
+ * when the whole-pixel camera (I, J) changes, so most 240 Hz pictures reuse
+ * earlier captures instead of re-running the VDP renderer up to 5 times. */
+#define WV_SLOTS 8
+typedef struct {
+    int      valid; unsigned serial, stamp; uint64_t key;
+    uint8_t  s[WV_H][WV_W];        /* sprite colour */
+    uint8_t  f[WV_H][WV_W];        /* 1 opaque, 2 high, 4 shadow op, 8 highlight op */
+    uint8_t  any[WV_H];            /* row has any sprite flag */
+} WVSprSlot;
+typedef struct {
+    int      valid, I, J; unsigned serial, stamp;
+    uint8_t  a[WV_H][WV_W], b[WV_H][WV_W], bd[WV_H], sm[WV_H];
+    uint8_t  da[WV_H][WV_W], db[WV_H][WV_W];   /* 1-px dither pattern marks */
+} WVPlaneSlot;
+static WVSprSlot   s_sslot[WV_SLOTS];
+static WVPlaneSlot s_pslot[2];
+static unsigned    s_stamp;
+static unsigned long long s_cap_n, s_cap_reuse;
+static int         s_dither = -1;              /* WOTES_DITHER_BLEND, default on */
+static unsigned long long s_dither_px;
+static uint32_t    s_unbl[WV_H][WV_W];          /* sub-pixel (0,0) before blending: exactness check */
+static uint8_t     s_mtmp[WV_H][WV_W];
+
+static uint64_t fnv32(uint64_t h, uint32_t v)
+{ for (int i = 0; i < 4; i++) { h ^= (v >> (8 * i)) & 0xFFu; h *= 1099511628211ull; } return h; }
+
+/* Mark pixels inside horizontal ABAB.. runs (4+ pixels). */
+static void wv_alt8(const uint8_t *r, int W, uint8_t *m)
+{
+    memset(m, 0, (size_t)W);
+    for (int x = 0; x + 3 < W;) {
+        if (r[x] != r[x + 1] && r[x] == r[x + 2] && r[x + 1] == r[x + 3]) {
+            int e = x + 3;
+            while (e + 1 < W && r[e + 1] == r[e - 1]) e++;
+            memset(m + x, 1, (size_t)(e - x + 1));
+            x = e + 1;
+        } else x++;
+    }
+}
+
+/* Dither = an alternating run that continues on a neighbouring row (checker
+ * or 1-px stripes): the mountain shading. Single-row patterns (text) are not. */
+static void wv_mark_dither(uint8_t (*p)[WV_W], uint8_t (*d)[WV_W], int W, int H)
+{
+    for (int y = 0; y < H; y++) wv_alt8(p[y], W, s_mtmp[y]);
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+        d[y][x] = (uint8_t)(s_mtmp[y][x] && ((y > 0 && s_mtmp[y - 1][x]) || (y + 1 < H && s_mtmp[y + 1][x])));
+}
+
+/* Replace each marked pixel of an ABAB colour run with the A/B average, the way
+ * a TV's blur showed it. Static and moving pictures get the same flat shade, so
+ * scrolling no longer makes the pattern shimmer. */
+static void wv_blend_row(uint32_t *r, const uint8_t *m, int W, int skip_clear)
+{
+    for (int x = 0; x + 3 < W;) {
+        if (r[x] != r[x + 1] && r[x] == r[x + 2] && r[x + 1] == r[x + 3] &&
+            (!skip_clear || (r[x] && r[x + 1]))) {
+            int e = x + 3;
+            while (e + 1 < W && r[e + 1] == r[e - 1]) e++;
+            uint32_t A = r[x], B = r[x + 1];
+            uint32_t avg = ((A & 0xFEFEFEFEu) >> 1) + ((B & 0xFEFEFEFEu) >> 1) + (A & B & 0x01010101u);
+            for (int i = x; i <= e; i++) if (m[i]) { r[i] = avg; s_dither_px++; }
+            x = e + 1;
+        } else x++;
+    }
+}
 static uint32_t s_native[WV_W * WV_H];
 static double   s_t_sum, s_t_max;
 static unsigned s_t_n, s_t_groups;
@@ -429,7 +515,7 @@ static int wv_scale_real(const WVFrame *f, uint32_t *image, int stride, int heig
 
 /* Camera and sprites at phase p in 1/S pixel units. The scratch copy gets the
  * whole-pixel part; q/r (camera) and each group's fx/fy are the remainders. */
-static void wv_apply_motion_q(GVDP *w, double p, int S, int *q, int *r,
+static void wv_apply_motion_q(GVDP *w, double p, int S, int *q, int *r, int *pI, int *pJ,
                               uint8_t grp[WV_MAX_SPR], WVGroup *g, int *ng)
 {
     int dhs = wrap10(s_cam_hs[1] - s_cam_hs[0]), dvs = wrap10(s_cam_vs[1] - s_cam_vs[0]);
@@ -437,7 +523,7 @@ static void wv_apply_motion_q(GVDP *w, double p, int S, int *q, int *r,
     double ov = (dvs > 32 || dvs < -32) ? 0.0 : dvs * (p - 1.0);
     int oq = qround(S * o), I = fdiv(oq, S);
     int nv = qround(-S * ov), vq = -nv, J = fdiv(vq, S);
-    *q = oq - I * S; *r = vq - J * S;
+    *q = oq - I * S; *r = vq - J * S; *pI = I; *pJ = J;
     if (I) {
         uint32_t base = hs_base(w); int mode = w->reg[11] & 3, step = mode == 3 ? 4 : mode == 2 ? 32 : 0;
         int lines = step ? (mode == 3 ? 224 : 28) : 1;
@@ -479,38 +565,110 @@ static void wv_apply_motion_q(GVDP *w, double p, int S, int *q, int *r,
     }
 }
 
-/* Capture planes (once) and each group's sprite layer, then compose at S x S. */
+/* Slot lookups (per real frame; slots from older frames are free). */
+static WVPlaneSlot *wv_plane_find(unsigned serial, int I, int J)
+{
+    for (int i = 0; i < 2; i++)
+        if (s_pslot[i].valid && s_pslot[i].serial == serial && s_pslot[i].I == I && s_pslot[i].J == J)
+            return &s_pslot[i];
+    return NULL;
+}
+static WVPlaneSlot *wv_plane_victim(unsigned serial)
+{
+    for (int i = 0; i < 2; i++) if (!s_pslot[i].valid || s_pslot[i].serial != serial) return &s_pslot[i];
+    return s_pslot[0].stamp <= s_pslot[1].stamp ? &s_pslot[0] : &s_pslot[1];
+}
+static WVSprSlot *wv_spr_find(unsigned serial, uint64_t key)
+{
+    for (int i = 0; i < WV_SLOTS; i++)
+        if (s_sslot[i].valid && s_sslot[i].serial == serial && s_sslot[i].key == key) return &s_sslot[i];
+    return NULL;
+}
+static WVSprSlot *wv_spr_victim(unsigned serial, unsigned now)
+{
+    WVSprSlot *best = NULL;
+    for (int i = 0; i < WV_SLOTS; i++) {
+        WVSprSlot *s = &s_sslot[i];
+        if (s->stamp == now) continue;                 /* used by this picture */
+        if (!s->valid || s->serial != serial) return s;
+        if (!best || s->stamp < best->stamp) best = s;
+    }
+    return best;
+}
+
+/* Planes and each group's sprite layer (cached per frame), then compose at S x S. */
 static int wv_compose_q(GVDP *w, const WVFrame *f, uint32_t *image, int stride, int H, int S,
-                        int q, int r, const uint8_t grp[WV_MAX_SPR], WVGroup *g, int ng)
+                        int q, int r, int I, int J, const uint8_t grp[WV_MAX_SPR], WVGroup *g, int ng)
 {
     int W = f->width, SW = W * S;
     WVSprite spr[WV_MAX_SPR];
-    uint16_t ysave[WV_MAX_SPR];
+    uint16_t ysave[WV_MAX_SPR], xw[WV_MAX_SPR];
     int n = wv_sprites(w, spr);
     uint32_t sat = sat_base(w);
     for (int i = 0; i < n; i++) {
         int gi = grp[spr[i].entry];
         if (i < g[gi].rank) g[gi].rank = i;          /* front-most member: link order */
         ysave[i] = rd16(w, sat + (uint32_t)spr[i].entry * 8u);
+        xw[i]    = rd16(w, sat + (uint32_t)spr[i].entry * 8u + 6u);
     }
+
+    unsigned now = ++s_stamp;
+    WVSprSlot *gsl[WV_MAX_GRP];
+    int need[WV_MAX_GRP];
     for (int gi = 0; gi < ng; gi++) {
+        uint64_t key = fnv32(1469598103934665603ull, f->serial);
+        for (int i = 0; i < n; i++) if (grp[spr[i].entry] == gi) {
+            key = fnv32(key, (uint32_t)spr[i].entry);
+            key = fnv32(key, (uint32_t)ysave[i] << 16 | xw[i]);
+        }
+        WVSprSlot *s = wv_spr_find(f->serial, key);
+        need[gi] = !s;
+        if (!s) { s = wv_spr_victim(f->serial, now); s->valid = 0; s->key = key; }
+        else s_cap_reuse++;
+        s->stamp = now;
+        gsl[gi] = s;
+    }
+    WVPlaneSlot *pl = wv_plane_find(f->serial, I, J);
+    int fill_pl = !pl;
+    if (pl) s_cap_reuse++;
+    else { pl = wv_plane_victim(f->serial); pl->valid = 0; }
+    pl->stamp = now;
+
+    /* gi == ng: planes still missing although every sprite layer was cached. */
+    for (int gi = 0; gi <= ng; gi++) {
+        WVSprSlot *ss = NULL;
+        if (gi < ng) { if (!need[gi]) continue; ss = gsl[gi]; }
+        else if (!fill_pl) break;
         for (int i = 0; i < n; i++)                  /* only this group's sprites visible */
             wr16(w, sat + (uint32_t)spr[i].entry * 8u,
                  grp[spr[i].entry] == gi ? ysave[i] : (uint16_t)(ysave[i] & 0xFC00));
         for (int y = 0; y < H; y++) {
-            if (!gvdp_capture_scanline(w, y, &s_row)) return 0;
+            if (!gvdp_capture_scanline(w, y, &s_row)) goto fail;
             if ((int)s_row.width != W || s_row.start || (int)s_row.count != W || !s_row.display ||
-                s_row.private_planes || s_row.diagnostic) return 0;
-            if (gi == 0) {
-                memcpy(s_pa[y], s_row.plane_a, (size_t)W); memcpy(s_pb[y], s_row.plane_b, (size_t)W);
-                s_bd[y] = s_row.backdrop; s_sm[y] = s_row.shadow_mode;
+                s_row.private_planes || s_row.diagnostic) goto fail;
+            if (fill_pl) {
+                memcpy(pl->a[y], s_row.plane_a, (size_t)W); memcpy(pl->b[y], s_row.plane_b, (size_t)W);
+                pl->bd[y] = s_row.backdrop; pl->sm[y] = s_row.shadow_mode;
             }
-            memcpy(s_gs[gi][y], s_row.sprite, (size_t)W);
-            uint8_t *fl = s_gf[gi][y];
-            for (int x = 0; x < W; x++)
-                fl[x] = (uint8_t)((s_row.opaque[x] != 0) | (s_row.high[x] != 0) << 1 |
-                                  (s_row.shadow_op[x] != 0) << 2 | (s_row.hilite_op[x] != 0) << 3);
+            if (ss) {
+                memcpy(ss->s[y], s_row.sprite, (size_t)W);
+                uint8_t *fl = ss->f[y], any = 0;
+                for (int x = 0; x < W; x++) {
+                    fl[x] = (uint8_t)((s_row.opaque[x] != 0) | (s_row.high[x] != 0) << 1 |
+                                      (s_row.shadow_op[x] != 0) << 2 | (s_row.hilite_op[x] != 0) << 3);
+                    any |= fl[x];
+                }
+                ss->any[y] = any != 0;
+            }
         }
+        if (fill_pl) {
+            wv_mark_dither(pl->a, pl->da, W, H);
+            wv_mark_dither(pl->b, pl->db, W, H);
+            pl->serial = f->serial; pl->I = I; pl->J = J; pl->valid = 1;
+            fill_pl = 0;
+        }
+        if (ss) { ss->serial = f->serial; ss->valid = 1; }
+        s_cap_n++;
     }
     for (int i = 0; i < n; i++) wr16(w, sat + (uint32_t)spr[i].entry * 8u, ysave[i]);
 
@@ -525,7 +683,7 @@ static int wv_compose_q(GVDP *w, const WVFrame *f, uint32_t *image, int stride, 
     int right = (wxr & 128) != 0;
 
     static uint32_t var[4][WV_W];
-    uint8_t a[WV_W], b[WV_W], sp[WV_W], op[WV_W], hi[WV_W], so[WV_W], ho[WV_W], idx[WV_W];
+    uint8_t a[WV_W], b[WV_W], sp[WV_W], op[WV_W], hi[WV_W], so[WV_W], ho[WV_W], idx[WV_W], dm[WV_W];
     int key[1 + WV_MAX_GRP], prev[1 + WV_MAX_GRP], have_prev = 0;
     for (int y = 0; y < H; y++) {
         int vert = (wyr & 128) ? y >= window_y : y < window_y;
@@ -533,8 +691,11 @@ static int wv_compose_q(GVDP *w, const WVFrame *f, uint32_t *image, int stride, 
             uint32_t *dst = image + (size_t)(y * S + k) * stride;
             int ya = y + (k + r >= S); if (ya > H - 1) ya = H - 1;
             key[0] = ya;
-            for (int gi = 0; gi < ng; gi++) key[1 + gi] = y - (k < g[gi].fy);
-            if (have_prev && !memcmp(key, prev, sizeof(int) * (size_t)(1 + ng)) && k) {
+            for (int gi = 0; gi < ng; gi++) {         /* -1: no sprite of this group on that row */
+                int ys = y - (k < g[gi].fy);
+                key[1 + gi] = (ys >= 0 && ys < H && gsl[gi]->any[ys]) ? ys : -1;
+            }
+            if (have_prev && k && !memcmp(key, prev, sizeof(int) * (size_t)(1 + ng))) {
                 memcpy(dst, dst - stride, (size_t)SW * sizeof *dst);
                 continue;
             }
@@ -542,32 +703,40 @@ static int wv_compose_q(GVDP *w, const WVFrame *f, uint32_t *image, int stride, 
             int vmask[4], nvar = 0;
             for (int kx = 0; kx < S; kx++) {
                 int mask = kx < q;
-                for (int gi = 0; gi < ng; gi++) mask |= (kx < g[gi].fx) << (1 + gi);
+                for (int gi = 0; gi < ng; gi++)
+                    if (key[1 + gi] >= 0) mask |= (kx < g[gi].fx) << (1 + gi);
                 int v = 0;
                 while (v < nvar && vmask[v] != mask) v++;
                 if (v == nvar) {
                     vmask[nvar++] = mask;
-                    int ps = mask & 1;
+                    int ps = mask & 1, anyd = 0;
                     for (int x = 0; x < W; x++) {
                         int c = x - ps; if (c < 0) c = 0;
                         int win = vert || (right ? x >= window_x : x < window_x);
-                        a[x] = win ? s_pa[y][x] : s_pa[ya][c];   /* window never scrolls */
-                        b[x] = s_pb[ya][c];
+                        a[x] = win ? pl->a[y][x] : pl->a[ya][c];   /* window never scrolls */
+                        b[x] = pl->b[ya][c];
+                        dm[x] = (uint8_t)((!win && pl->da[ya][c]) || pl->db[ya][c]);
+                        anyd |= dm[x];
                     }
                     memset(sp, 0, (size_t)W); memset(op, 0, (size_t)W); memset(hi, 0, (size_t)W);
                     memset(so, 0, (size_t)W); memset(ho, 0, (size_t)W);
                     for (int oi = 0; oi < ng; oi++) {
                         int gi = order[oi], ys = key[1 + gi], sh = (mask >> (1 + gi)) & 1;
-                        if (ys < 0 || ys >= H) continue;
-                        const uint8_t *gs = s_gs[gi][ys], *gf = s_gf[gi][ys];
+                        if (ys < 0) continue;
+                        const uint8_t *gs = gsl[gi]->s[ys], *gf = gsl[gi]->f[ys];
                         for (int x = sh; x < W; x++) {
                             int c = x - sh, fl = gf[c];
                             if (fl & 1) { sp[x] = gs[c]; op[x] = 1; hi[x] = (uint8_t)((fl >> 1) & 1); }
                             so[x] |= (uint8_t)((fl >> 2) & 1); ho[x] |= (uint8_t)((fl >> 3) & 1);
                         }
                     }
-                    gvdp_compose_span(idx, a, b, sp, op, hi, so, ho, W, s_bd[y], s_sm[y]);
+                    gvdp_compose_span(idx, a, b, sp, op, hi, so, ho, W, pl->bd[y], pl->sm[y]);
                     for (int x = 0; x < W; x++) var[v][x] = pal[idx[x]];
+                    if (k == 0 && kx == 0) memcpy(s_unbl[y], var[v], (size_t)W * sizeof var[v][0]);
+                    if (s_dither && anyd) {
+                        for (int x = 0; x < W; x++) if (op[x]) dm[x] = 0;   /* sprites stay crisp */
+                        wv_blend_row(var[v], dm, W, 0);
+                    }
                 }
                 const uint32_t *src = var[v];
                 for (int x = 0; x < W; x++) dst[x * S + kx] = src[x];
@@ -575,15 +744,25 @@ static int wv_compose_q(GVDP *w, const WVFrame *f, uint32_t *image, int stride, 
         }
     }
     return 1;
+fail:
+    for (int i = 0; i < n; i++) wr16(w, sat + (uint32_t)spr[i].entry * 8u, ysave[i]);
+    return 0;
+}
+
+static void wv_dither_env(void)
+{
+    if (s_dither < 0) { const char *d = getenv("WOTES_DITHER_BLEND"); s_dither = !(d && *d == '0'); }
 }
 
 static int wotes_presentation_scale(void)
 {
+    wv_dither_env();
     if (s_scale < 0) {
         const char *e = getenv("WOTES_VIDEO_SCALE");
         s_scale = e && *e ? atoi(e) : 4;
         if (s_scale < 2 || s_scale > 4) s_scale = 1;
-        fprintf(stderr, "[WOTES-VIDEO] in-between pictures drawn at %dx\n", s_scale);
+        fprintf(stderr, "[WOTES-VIDEO] in-between pictures drawn at %dx, dither blending %s\n",
+                s_scale, s_dither ? "on" : "off (WOTES_DITHER_BLEND=0)");
     }
     wv_motion_env();
     return s_motion ? s_scale : 1;       /* self-check mode stays native */
@@ -615,30 +794,32 @@ static int wotes_interpolate_scaled(double phase, uint32_t *image, int stride,
         if (s_log)
             fprintf(stderr, "[WOTES-VIDEO] frame %u self-check: %llu px differ (%llu/%llu differed) cam %+d,%+d "
                     "| %dx pictures: avg %.2f ms max %.2f ms, up to %u sprite groups, %llu fallbacks, "
-                    "4x-vs-real %llu px (%llu/%llu differed)\n",
+                    "4x-vs-real %llu px (%llu/%llu differed) | captures %llu, reused %llu, dither px %llu\n",
                     f->serial, diff, s_check_fail, s_checks,
                     wrap10(s_cam_hs[1] - s_cam_hs[0]), wrap10(s_cam_vs[1] - s_cam_vs[0]),
                     S, s_t_n ? s_t_sum / s_t_n : 0.0, s_t_max, s_t_groups, s_fallbacks,
-                    s_qdiff_last, s_qcheck_fail, s_qchecks);
+                    s_qdiff_last, s_qcheck_fail, s_qchecks, s_cap_n, s_cap_reuse, s_dither_px);
         s_qcheck_pending = 1;
         s_t_sum = s_t_max = 0; s_t_n = s_t_groups = 0;
+        s_cap_n = s_cap_reuse = s_dither_px = 0;
         if (diff) return wv_scale_real(f, image, stride, height, S);
     }
     if (gvdp_interlace_double(&f->vdp)) return wv_scale_real(f, image, stride, height, S);
 
     s_work = f->vdp;
-    int q, r, ng;
+    int q, r, I, J, ng;
     uint8_t grp[WV_MAX_SPR];
     WVGroup g[WV_MAX_GRP];
-    wv_apply_motion_q(&s_work, phase, S, &q, &r, grp, g, &ng);
-    if (!wv_compose_q(&s_work, f, image, stride, height, S, q, r, grp, g, ng))
+    wv_apply_motion_q(&s_work, phase, S, &q, &r, &I, &J, grp, g, &ng);
+    if (!wv_compose_q(&s_work, f, image, stride, height, S, q, r, I, J, grp, g, ng))
         return wv_scale_real(f, image, stride, height, S);
 
-    /* At phase 1 the 4x picture must be exactly the real frame, enlarged. */
+    /* At phase 1 the 4x picture (before dither blending) must be exactly the
+     * real frame, enlarged. */
     if (s_qcheck_pending && phase > 0.999) {
         unsigned long long d = 0;
         for (int y = 0; y < height; y++) for (int x = 0; x < f->width; x++)
-            d += image[(size_t)(y * S) * stride + (size_t)x * S] != f->real[(size_t)y * WV_W + x];
+            d += s_unbl[y][x] != f->real[(size_t)y * WV_W + x];
         s_qchecks++; if (d) s_qcheck_fail++;
         s_qdiff_last = d; s_qcheck_pending = 0;
     }
@@ -649,6 +830,398 @@ static int wotes_interpolate_scaled(double phase, uint32_t *image, int stride,
     return 1;
 }
 
+/* ------------------------------------------------------------ GPU layers --
+ * Step 4.5 (DuckTales lesson 9): build each real frame ONCE as layers at
+ * native size and let the graphics card place them at fractional positions for
+ * every in-between picture (GameVideo.presentation_layers). Back to front:
+ *   L0  planes without sprites (backdrop, B, A), scrolled, margin LM px
+ *   W0  window plane (side panel) composed the same way, never moves
+ *   low-priority sprites, one layer per group of sprites that move together
+ *   L2  high-priority plane pixels (scrolled), W2 the window's
+ *   high-priority sprites, per group
+ * That is the VDP's own order (backdrop < low planes < low sprites < high
+ * planes < high sprites) because this game never uses shadow/highlight; any
+ * frame that does (or interlace, blank rows, ...) falls back to the CPU path.
+ * Planes come from the real frame's rows (window on: W0/W2) plus one capture
+ * with the window off (the map under the side panel) and one at the previous
+ * camera (the edge strip a moving camera reveals). Sprites are decoded from
+ * the SAT into their group's layer, keeping only pixels where the real frame
+ * shows a sprite (so masks and line limits stay exact), back sprites kept under
+ * front ones (no holes when they separate). Once a second the layers are
+ * composed at the frame's own positions on the CPU and must equal the real
+ * picture, else that frame uses the CPU path. WOTES_VIDEO_GPU=0 = off. */
+#define LM 32
+#define LCW (WV_W + 2 * LM)
+#define LCH (WV_H + 2 * LM)
+#define WV_LGRP 14
+
+typedef struct { uint32_t px[WV_H * WV_W]; int x0, y0, x1, y1; } WVSLayer;   /* bbox: [x0,x1) x [y0,y1) */
+
+static int      s_gpu = -1;
+static unsigned s_lay_serial;
+static int      s_lay_ok;
+static uint32_t s_L0[LCH * LCW], s_L2[LCH * LCW];
+static uint32_t s_W0[WV_H * WV_W], s_W2[WV_H * WV_W];
+static int      s_have_win, s_cx0, s_cx1, s_cy0, s_cy1;   /* non-window (scrolling) rectangle */
+static WVSLayer s_sl[WV_LGRP][2];
+static int      s_lgn, s_lg_rep[WV_LGRP], s_lg_rank[WV_LGRP], s_lg_order[WV_LGRP];
+static uint8_t  s_c0a[WV_H][WV_W], s_c0b[WV_H][WV_W], s_c1a[WV_H][WV_W], s_c1b[WV_H][WV_W];
+static uint8_t  s_lda[WV_H][WV_W], s_ldb[WV_H][WV_W];
+static double   s_lt_sum, s_lt_max;
+static unsigned s_lt_n, s_lpics, s_lmax, s_llog_serial;
+static unsigned long long s_lchecks, s_lcheck_fail, s_lcheck_last, s_lfall, s_lfall_check;
+
+static void wv_cam_offset(double p, double *o, double *ov)
+{
+    int dhs = wrap10(s_cam_hs[1] - s_cam_hs[0]), dvs = wrap10(s_cam_vs[1] - s_cam_vs[0]);
+    *o  = (dhs > 32 || dhs < -32) ? 0.0 : dhs * (p - 1.0);
+    *ov = (dvs > 32 || dvs < -32) ? 0.0 : dvs * (p - 1.0);
+}
+
+static void wv_shift_scroll(GVDP *w, int I, int J)
+{
+    if (I) {
+        uint32_t base = hs_base(w); int mode = w->reg[11] & 3, step = mode == 3 ? 4 : mode == 2 ? 32 : 0;
+        int lines = step ? (mode == 3 ? 224 : 28) : 1;
+        for (int i = 0; i < lines; i++) for (int plane = 0; plane < 2; plane++) {
+            uint32_t a = base + (uint32_t)i * (uint32_t)step + (uint32_t)plane * 2u;
+            uint16_t d = rd16(w, a);
+            wr16(w, a, (uint16_t)((d & 0xFC00) | ((d + I) & 0x3FF)));
+        }
+    }
+    if (J) {
+        int cols = (w->reg[11] & 4) ? GVDP_VSRAM_ENTRIES : 2;
+        for (int i = 0; i < cols; i++) w->vsram[i] = (uint16_t)((w->vsram[i] & 0xFC00) | ((w->vsram[i] + J) & 0x3FF));
+    }
+}
+
+/* Planes of frame f with the window off, scroll moved by whole pixels I/J. */
+static int wv_cap_planes(const WVFrame *f, int I, int J, uint8_t (*pa)[WV_W], uint8_t (*pb)[WV_W])
+{
+    GVDP *w = &s_work;
+    *w = f->vdp;
+    w->reg[17] = 0; w->reg[18] = 0;                       /* no window */
+    wv_shift_scroll(w, I, J);
+    WVSprite spr[WV_MAX_SPR];
+    int n = wv_sprites(w, spr);
+    uint32_t sat = sat_base(w);
+    for (int i = 0; i < n; i++) {                         /* sprites off: planes only */
+        uint32_t e = sat + (uint32_t)spr[i].entry * 8u;
+        wr16(w, e, (uint16_t)(rd16(w, e) & 0xFC00));
+    }
+    for (int y = 0; y < f->height; y++) {
+        if (!gvdp_capture_scanline(w, y, &s_row)) return 0;
+        if ((int)s_row.width != f->width || s_row.start || (int)s_row.count != f->width || !s_row.display ||
+            s_row.private_planes || s_row.diagnostic || s_row.shadow_mode) return 0;
+        memcpy(pa[y], s_row.plane_a, (size_t)f->width);
+        memcpy(pb[y], s_row.plane_b, (size_t)f->width);
+    }
+    return 1;
+}
+
+/* Fractional screen offset of an object's sprites at phase p, relative to
+ * where the latest frame put them. */
+static void wv_obj_offset(const WVFrame *f, int oi, double p, double *dx, double *dy)
+{
+    const WVObj *ob = &s_obj[oi];
+    uint32_t e = sat_base(&f->vdp) + (uint32_t)ob->slot * 8u;
+    int sx0 = (rd16(&f->vdp, e + 6) & 0x1FF) - 128, sy0 = (rd16(&f->vdp, e) & 0x3FF) - 128;
+    double o, ov, x, y;
+    wv_cam_offset(p, &o, &ov);
+    obj_display(ob, p, &x, &y);
+    double X = x + o + s_cam_hs[1] - sx0, Y = y - ov - s_cam_vs[1] - sy0;
+    X -= 512.0 * floor((X + 256.0) / 512.0);
+    Y -= 512.0 * floor((Y + 256.0) / 512.0);
+    if (fabs(X) > 48.0 || fabs(Y) > 48.0) X = Y = 0.0;   /* cut */
+    *dx = X; *dy = Y;
+}
+
+static void wv_plane_px(uint32_t A, uint32_t B, uint32_t bd, const uint32_t *pal, uint32_t *c0, uint32_t *c2)
+{
+    unsigned ah = (A & 0xC0u) == 0xC0u, bh = (B & 0xC0u) == 0xC0u;
+    unsigned c = ah ? A & 63u : bh ? B & 63u : (A & 64u) ? A & 63u : (B & 64u) ? B & 63u : bd;
+    *c0 = pal[c] | 0xFF000000u;
+    *c2 = ah ? pal[A & 63u] | 0xFF000000u : bh ? pal[B & 63u] | 0xFF000000u : 0u;
+}
+
+static int wv_in_scroll(int x, int y) { return x >= s_cx0 && x < s_cx1 && y >= s_cy0 && y < s_cy1; }
+
+/* The layers composed at the frame's own positions (offset 0) vs the real picture. */
+static uint32_t s_lcomp[WV_H * WV_W];
+static unsigned long long s_ld_spr, s_ld_plane, s_ld_win;   /* failing pixels: sprite shown / plane only / in window */
+static unsigned s_ldumps;
+static unsigned long long wv_layers_check(const WVFrame *f)
+{
+    unsigned long long d = 0;
+    for (int y = 0; y < f->height; y++) for (int x = 0; x < f->width; x++) {
+        int sc = wv_in_scroll(x, y), i = y * WV_W + x;
+        uint32_t c = sc ? s_L0[(y + LM) * LCW + x + LM] : s_W0[i];
+        for (int k = 0; k < s_lgn; k++) { uint32_t p = s_sl[s_lg_order[k]][0].px[i]; if (p) c = p; }
+        uint32_t h = sc ? s_L2[(y + LM) * LCW + x + LM] : s_W2[i];
+        if (h) c = h;
+        for (int k = 0; k < s_lgn; k++) { uint32_t p = s_sl[s_lg_order[k]][1].px[i]; if (p) c = p; }
+        s_lcomp[i] = c | 0xFF000000u;
+        if ((c ^ f->real[(size_t)y * WV_W + x]) & 0xFFFFFFu) {
+            d++;
+            if (!sc) s_ld_win++;
+            else if (f->rf[y][x]) s_ld_spr++;
+            else s_ld_plane++;
+        }
+    }
+    if (d && s_ldumps < 4) {                       /* WOTES_LAYER_DUMP=<folder>: PNGs of failing frames */
+        const char *dir = getenv("WOTES_LAYER_DUMP");
+        if (dir && *dir) {
+            char path[1024];
+            static uint32_t diffimg[WV_H * WV_W];
+            for (int i = 0; i < WV_H * WV_W; i++) diffimg[i] = 0xFF000000u;
+            for (int y = 0; y < f->height; y++) for (int x = 0; x < f->width; x++)
+                if ((s_lcomp[y * WV_W + x] ^ f->real[(size_t)y * WV_W + x]) & 0xFFFFFFu)
+                    diffimg[y * WV_W + x] = 0xFFFF00FFu;
+                else diffimg[y * WV_W + x] = 0xFF000000u | ((f->real[(size_t)y * WV_W + x] >> 2) & 0x3F3F3Fu);
+            snprintf(path, sizeof path, "%s/layers-fail-%u-real.png", dir, s_ldumps);
+            png_write_argb(path, f->real, f->width, f->height, WV_W);
+            snprintf(path, sizeof path, "%s/layers-fail-%u-ours.png", dir, s_ldumps);
+            png_write_argb(path, s_lcomp, f->width, f->height, WV_W);
+            snprintf(path, sizeof path, "%s/layers-fail-%u-diff.png", dir, s_ldumps);
+            png_write_argb(path, diffimg, f->width, f->height, WV_W);
+            fprintf(stderr, "[WOTES-VIDEO] frame %u layer check: %llu px differ, wrote %s/layers-fail-%u-*.png\n",
+                    f->serial, d, dir, s_ldumps);
+        }
+        s_ldumps++;
+    }
+    return d;
+}
+
+static int wv_build_layers(WVFrame *f)
+{
+    int W = f->width, H = f->height;
+    if (!f->raster_ok || W <= 0 || W > WV_W || H <= 0 || H > WV_H || gvdp_interlace_double(&f->vdp)) return 0;
+    const GVDP *v = &f->vdp;
+
+    /* The window covers whole rows (vertical part) and/or whole columns
+     * (horizontal part); what scrolls is the rectangle left over. */
+    int wxr = v->reg[17], wyr = v->reg[18], window_x = (wxr & 31) * 16, window_y = (wyr & 31) * 8;
+    s_cx0 = (wxr & 128) ? 0 : window_x; s_cx1 = (wxr & 128) ? window_x : W;
+    s_cy0 = (wyr & 128) ? 0 : window_y; s_cy1 = (wyr & 128) ? window_y : H;
+    if (s_cx0 > W) s_cx0 = W;
+    if (s_cx1 > W) s_cx1 = W;
+    if (s_cy0 > H) s_cy0 = H;
+    if (s_cy1 > H) s_cy1 = H;
+    s_have_win = !(s_cx0 == 0 && s_cx1 == W && s_cy0 == 0 && s_cy1 == H);
+
+    uint8_t (*pa)[WV_W] = f->ra, (*pb)[WV_W] = f->rb;
+    if (s_have_win) {
+        if (!wv_cap_planes(f, 0, 0, s_c0a, s_c0b)) return 0;
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)   /* outside the window: the real rows */
+            if (wv_in_scroll(x, y)) { s_c0a[y][x] = f->ra[y][x]; s_c0b[y][x] = f->rb[y][x]; }
+        pa = s_c0a; pb = s_c0b;
+    }
+    int dhs = wrap10(s_cam_hs[1] - s_cam_hs[0]), dvs = wrap10(s_cam_vs[1] - s_cam_vs[0]);
+    int I1 = (dhs > 32 || dhs < -32) ? 0 : -dhs, J1 = (dvs > 32 || dvs < -32) ? 0 : -dvs;
+    int Dx = I1, Dy = -J1;              /* latest (x,y) shows at (x+Dx, y+Dy) at the previous camera */
+    int have_c1 = (I1 || J1) && wv_cap_planes(f, I1, J1, s_c1a, s_c1b);
+
+    uint32_t pal[GVDP_OUTPUT_PALETTE_SIZE];
+    wv_palette(v, f->host, pal);
+
+    for (int cy = 0; cy < LCH; cy++) {
+        int y = cy - LM, yc = y < 0 ? 0 : y >= H ? H - 1 : y;
+        uint32_t *r0 = &s_L0[cy * LCW], *r2 = &s_L2[cy * LCW];
+        for (int cx = 0; cx < LCW; cx++) {
+            int x = cx - LM, xs = x + Dx, ys = y + Dy;
+            if (x >= 0 && x < W && y >= 0 && y < H) {
+                wv_plane_px(pa[y][x], pb[y][x], f->rbd[y], pal, &r0[cx], &r2[cx]);
+                if (!f->rf[y][x] && wv_in_scroll(x, y)) {      /* no sprite: the real pixel is the plane */
+                    uint32_t rc = f->real[(size_t)y * WV_W + x] | 0xFF000000u;
+                    r0[cx] = rc; if (r2[cx]) r2[cx] = rc;
+                }
+            }
+            else if (have_c1 && xs >= 0 && xs < W && ys >= 0 && ys < H)
+                wv_plane_px(s_c1a[ys][xs], s_c1b[ys][xs], f->rbd[ys], pal, &r0[cx], &r2[cx]);
+            else { r0[cx] = pal[f->rbd[yc]] | 0xFF000000u; r2[cx] = 0; }
+        }
+    }
+    if (s_have_win)
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            int i = y * WV_W + x;
+            if (wv_in_scroll(x, y)) { s_W0[i] = s_W2[i] = 0; continue; }
+            wv_plane_px(f->ra[y][x], f->rb[y][x], f->rbd[y], pal, &s_W0[i], &s_W2[i]);
+            if (!f->rf[y][x]) {
+                uint32_t rc = f->real[(size_t)y * WV_W + x] | 0xFF000000u;
+                s_W0[i] = rc; if (s_W2[i]) s_W2[i] = rc;
+            }
+        }
+
+    /* Sprite groups: sprites whose offsets match at three phases move together. */
+    for (int g = 0; g < WV_LGRP; g++) for (int k = 0; k < 2; k++) {
+        WVSLayer *L = &s_sl[g][k];
+        for (int y = L->y0; y < L->y1; y++) memset(&L->px[y * WV_W + L->x0], 0, (size_t)(L->x1 - L->x0) * 4u);
+        L->x0 = WV_W; L->y0 = WV_H; L->x1 = L->y1 = 0;
+    }
+    WVSprite spr[WV_MAX_SPR];
+    int n = wv_sprites(v, spr), sg[WV_MAX_SPR];
+    static const double ph[3] = { 0.0, 0.37, 0.71 };
+    double sig[WV_LGRP][6];
+    s_lgn = 1; s_lg_rep[0] = -1; s_lg_rank[0] = INT_MAX;
+    for (int i = 0; i < n; i++) {
+        sg[i] = 0;
+        int oi = -1;
+        if (spr[i].x != -128)                               /* x = 0: line mask, no pixels */
+            for (int k = 0; k < WV_MAX_OBJ; k++)
+                if (s_obj[k].used && s_obj[k].seen && s_obj[k].slot == spr[i].entry) { oi = k; break; }
+        if (oi >= 0) {
+            double s6[6]; int moving = 0;
+            for (int k = 0; k < 3; k++) {
+                wv_obj_offset(f, oi, ph[k], &s6[2 * k], &s6[2 * k + 1]);
+                moving |= fabs(s6[2 * k]) > 1e-9 || fabs(s6[2 * k + 1]) > 1e-9;
+            }
+            if (moving) {
+                int g = 1;
+                for (; g < s_lgn; g++) {
+                    int same = 1;
+                    for (int k = 0; k < 6; k++) if (fabs(sig[g][k] - s6[k]) > 1e-6) { same = 0; break; }
+                    if (same) break;
+                }
+                if (g == s_lgn && s_lgn < WV_LGRP) {
+                    memcpy(sig[g], s6, sizeof s6); s_lg_rep[g] = oi; s_lg_rank[g] = INT_MAX; s_lgn++;
+                }
+                if (g < s_lgn) sg[i] = g;                  /* too many groups: stays put */
+            }
+        }
+        if (i < s_lg_rank[sg[i]]) s_lg_rank[sg[i]] = i;
+    }
+    for (int g = 0; g < s_lgn; g++) s_lg_order[g] = g;       /* back to front */
+    for (int a = 1; a < s_lgn; a++) for (int b = a; b > 0 && s_lg_rank[s_lg_order[b - 1]] < s_lg_rank[s_lg_order[b]]; b--)
+        { int t = s_lg_order[b]; s_lg_order[b] = s_lg_order[b - 1]; s_lg_order[b - 1] = t; }
+
+    /* Draw position of each sprite layer: lows (group order), L2, highs. A
+     * front sprite's pixel removes back pixels from every layer drawn above its
+     * own, so the front sprite shows exactly as the VDP shows it; back pixels in
+     * layers below stay (no holes when sprites separate). */
+    int lpos[WV_LGRP][2];
+    for (int k = 0; k < s_lgn; k++) { lpos[s_lg_order[k]][0] = k; lpos[s_lg_order[k]][1] = WV_LGRP + k; }
+    for (int i = n - 1; i >= 0; i--) {                       /* back sprites first */
+        const WVSprite *sp = &spr[i];
+        if (sp->x == -128) continue;
+        int g = sg[i], hp = (sp->attr >> 15) & 1, pb16 = ((sp->attr >> 13) & 3) * 16, ch = sp->h / 8;
+        WVSLayer *L = &s_sl[g][hp];
+        int mypos = lpos[g][hp];
+        for (int py = 0; py < sp->h; py++) {
+            int y = sp->y + py;
+            if (y < 0 || y >= H) continue;
+            int ty = (sp->attr & 0x1000) ? sp->h - 1 - py : py;
+            for (int px = 0; px < sp->w; px++) {
+                int x = sp->x + px;
+                if (x < 0 || x >= W || !f->rf[y][x]) continue;      /* not shown in the real frame */
+                int tx = (sp->attr & 0x800) ? sp->w - 1 - px : px;
+                uint32_t tile = ((uint32_t)(sp->attr & 0x7FF) + (uint32_t)((tx >> 3) * ch + (ty >> 3))) & 0x7FFu;
+                uint8_t byte = v->vram[(tile * 32u + (uint32_t)(ty & 7) * 4u + (uint32_t)((tx & 7) >> 1)) & 0xFFFFu];
+                int c = (tx & 1) ? byte & 15 : byte >> 4;
+                if (!c) continue;
+                int at = y * WV_W + x;
+                L->px[at] = pal[pb16 + c] | 0xFF000000u;
+                for (int g2 = 0; g2 < s_lgn; g2++) for (int h2 = 0; h2 < 2; h2++)
+                    if (lpos[g2][h2] > mypos) s_sl[g2][h2].px[at] = 0;   /* front sprite wins */
+                if (x < L->x0) L->x0 = x;
+                if (x + 1 > L->x1) L->x1 = x + 1;
+                if (y < L->y0) L->y0 = y;
+                if (y + 1 > L->y1) L->y1 = y + 1;
+            }
+        }
+    }
+
+    if (f->serial - s_llog_serial >= 60) {                       /* exactness, once a second */
+        unsigned long long d = wv_layers_check(f);
+        s_lchecks++; s_lcheck_last = d;
+        if (d) { s_lcheck_fail++; s_lfall_check++; return 0; }
+    }
+
+    if (s_dither) {                                          /* after the check: exact layers first */
+        wv_mark_dither(pa, s_lda, W, H);
+        wv_mark_dither(pb, s_ldb, W, H);
+        uint8_t dm[WV_W];
+        for (int y = s_cy0; y < s_cy1; y++) {
+            for (int x = 0; x < W; x++)
+                dm[x] = (uint8_t)(x >= s_cx0 && x < s_cx1 && (s_lda[y][x] || s_ldb[y][x]));
+            wv_blend_row(&s_L0[(y + LM) * LCW + LM], dm, W, 0);
+            wv_blend_row(&s_L2[(y + LM) * LCW + LM], dm, W, 1);
+        }
+    }
+    return 1;
+}
+
+static void wv_layer(GameVideoLayer *L, unsigned slot, const uint32_t *px, int w, int h, int stride,
+                     double x, double y, int clip)
+{
+    L->pixels = px; L->width = w; L->height = h; L->stride = stride;
+    L->slot = slot; L->version = (uint64_t)s_lay_serial << 8 | slot;
+    L->x = (float)x; L->y = (float)y;
+    if (clip) { L->clip_x = s_cx0; L->clip_y = s_cy0; L->clip_w = s_cx1 - s_cx0; L->clip_h = s_cy1 - s_cy0; }
+    else L->clip_x = L->clip_y = L->clip_w = L->clip_h = 0;
+}
+
+static int wotes_presentation_layers(double phase, GameVideoLayer *out, int max, int width, int height)
+{
+    if (!s_enabled || !s_frames || s_latest < 0) return 0;
+    if (s_gpu < 0) {
+        const char *e = getenv("WOTES_VIDEO_GPU");
+        s_gpu = !(e && *e == '0');
+        fprintf(stderr, "[WOTES-VIDEO] GPU layers %s\n", s_gpu ? "on" : "off (WOTES_VIDEO_GPU=0)");
+    }
+    if (!s_gpu) return 0;
+    WVFrame *f = &s_frames[s_latest];
+    if (!f->complete || f->width != width || f->height != height) return 0;
+    wv_motion_env();
+    if (!s_motion) return 0;
+    wv_dither_env();
+    wv_advance(f);
+
+    if (f->serial != s_lay_serial) {
+        double t0 = wv_now_ms();
+        s_lay_serial = f->serial;
+        s_lay_ok = wv_build_layers(f);
+        if (!s_lay_ok) s_lfall++;
+        double t = wv_now_ms() - t0;
+        s_lt_sum += t; s_lt_n++; if (t > s_lt_max) s_lt_max = t;
+        if (f->serial - s_llog_serial >= 60) {
+            s_llog_serial = f->serial;
+            if (s_log)
+                fprintf(stderr, "[WOTES-VIDEO] frame %u GPU layers: build avg %.2f ms max %.2f ms, "
+                        "%u pictures, up to %u layers, check %llu px (%llu/%llu failed), "
+                        "CPU-path frames %llu, dither px %llu | failing px: sprite %llu, plane %llu, window %llu\n",
+                        f->serial, s_lt_n ? s_lt_sum / s_lt_n : 0.0, s_lt_max, s_lpics, s_lmax,
+                        s_lcheck_last, s_lcheck_fail, s_lchecks, s_lfall, s_dither_px,
+                        s_ld_spr, s_ld_plane, s_ld_win);
+            s_lt_sum = s_lt_max = 0; s_lt_n = s_lpics = s_lmax = 0; s_dither_px = 0;
+        }
+    }
+    if (!s_lay_ok || max < 4 + 2 * WV_LGRP) return 0;
+
+    double o, ov, gx[WV_LGRP], gy[WV_LGRP];
+    wv_cam_offset(phase, &o, &ov);
+    gx[0] = gy[0] = 0.0;
+    for (int g = 1; g < s_lgn; g++) wv_obj_offset(f, s_lg_rep[g], phase, &gx[g], &gy[g]);
+    int k = 0, scroll = s_cx1 > s_cx0 && s_cy1 > s_cy0;
+    if (scroll) wv_layer(&out[k++], 0, s_L0, LCW, LCH, LCW, -LM + o, -LM - ov, 1);
+    if (s_have_win) wv_layer(&out[k++], 2, s_W0, f->width, f->height, WV_W, 0, 0, 0);
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass) {
+            if (scroll) wv_layer(&out[k++], 1, s_L2, LCW, LCH, LCW, -LM + o, -LM - ov, 1);
+            if (s_have_win) wv_layer(&out[k++], 3, s_W2, f->width, f->height, WV_W, 0, 0, 0);
+        }
+        for (int i = 0; i < s_lgn; i++) {
+            int g = s_lg_order[i];
+            const WVSLayer *L = &s_sl[g][pass];
+            if (L->x1 <= L->x0) continue;
+            wv_layer(&out[k++], 4u + 2u * (unsigned)g + (unsigned)pass, &L->px[L->y0 * WV_W + L->x0],
+                     L->x1 - L->x0, L->y1 - L->y0, WV_W, L->x0 + gx[g], L->y0 + gy[g], 0);
+        }
+    }
+    s_lpics++;
+    if ((unsigned)k > s_lmax) s_lmax = (unsigned)k;
+    return k;
+}
+
 const GameVideo wotes_video = {
     .presentation_configure = wotes_presentation_configure,
     .presentation_capture   = wotes_presentation_capture,
@@ -656,4 +1229,5 @@ const GameVideo wotes_video = {
     .presentation_reset     = wotes_presentation_reset,
     .presentation_scale     = wotes_presentation_scale,
     .interpolate_scaled     = wotes_interpolate_scaled,
+    .presentation_layers    = wotes_presentation_layers,
 };

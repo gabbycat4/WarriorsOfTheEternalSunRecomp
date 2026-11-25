@@ -13,7 +13,7 @@ How we work
 - Never commit the ROM (game/wotes.bin) or generated files.
 - I'm very sensitive to motion blur and uneven scrolling (eye strain).
   That's the whole point of Phase 4.
-- I work night shifts.
+
 
 Done
 - Phase 0-1: game plays cleanly (1087 native routines, engine fixes pushed to
@@ -22,20 +22,40 @@ Done
   every 9 frames.
 - Phase 3: 240 Hz pacing works (Esc -> Mods -> High refresh rate).
 - Phase 4.2: in-between pictures with motion. Battles are much smoother.
-- Phase 4.3 (code written, NOT TESTED YET): quarter-pixel (4x) in-between
-  pictures, so world-map scrolling should finally be smooth.
-  Engine: segagenesisrecomp/runner/game_video.h + main.c
-  (interpolate_scaled). Game: game/wotes_video.c. Off switch:
-  WOTES_VIDEO_SCALE=1.
+- Phase 4.3 tested (Step 26, measurements/quarter-1.*): 4x pictures are
+  pixel-exact, but drawing took avg 2-4 ms, max 10.6 ms while walking
+  (budget 4.17 ms at 240) -> 1,495 late pictures, 3.2 instead of 4 pictures
+  per frame = the stutters and the 180-240 FPS. Mountain shadows = 1-px
+  checker dither in the map tiles (not sprite flicker: reg12 = $81, sprite
+  counts steady), shimmering as it scrolls.
+- Phase 4.4 tested (Step 27, measurements/cache-1.*): dither blending
+  WORKS (user: mountains no longer flicker). Speed did not improve: cache
+  reused only ~50% while walking (grouping changes every picture), first
+  picture of each frame still draws everything; 3.68 pictures/frame,
+  2,915 late, 78 badly late. User: still 160-240 FPS.
+- Phase 4.5 WORKS (Step 28, gpu-1.*: 4.00 pictures/frame, late gaps 2,915 -> 157,
+  user sees 238-240 FPS, no flicker): GPU layers, the DuckTales
+  method (DuckTales_lessons.txt lesson 9). Each frame is built ONCE as
+  layers (planes low/high scrolled with a 32 px margin, side panel fixed,
+  sprites in groups that move together, low/high), the graphics card places
+  them at fractional positions. Engine: GameVideo.presentation_layers +
+  present_layers() in runner/main.c (GENESIS_GPU_LAYERS=0 = off). Game:
+  wotes_presentation_layers() in game/wotes_video.c (WOTES_VIDEO_GPU=0 = off,
+  falls back to the 4.4 CPU path). Backups: measurements/before-4.5/.
+
+- Phase 4.5b confirmed in a battle too (gpu-2.*: check 0/126 failed).
 
 Next
-1. Run Step 26 in STEPS.txt (rebuild, play the world map ~3 min). Report:
-   smooth? flicker or seams at sprite edges? Then Claude reads
-   measurements/quarter-1.stderr.txt (timing, "4x-vs-real" exactness) and
-   measurements/quarter-1.csv (late pictures).
-2. Dither blending comfort option (mountain shading shimmer).
-3. Eased battle camera (the enemy <-> party swing is too fast and blurry).
-4. Remove the pre-battle slowdown stutter (GameSpec main_cpu_divisor).
-5. Look into the 26 late pictures / 57 ms gap from motion-1.csv.
+1. Step 30a: commit. Step 30 (NOT TESTED YET): WOTES_CPU_HEADROOM=2
+   (GameSpec.main_cpu_divisor in game/wotes_spec.c). Cause of the walking
+   hitch: lag frames (worldmap-1.log: 7 in 6000 frames, heavy frame with
+   ~230-280 RAM bytes changed -> main loop misses a frame -> camera holds 1
+   frame -> 2 passes next frame). Claude counts lag frames in
+   measurements/headroom-1.log (it=0 frames while walking).
+2. Eased battle camera: user (Nov 25) also sees jerks when characters move
+   in battle, not only the enemy <-> party swing (pans are 2-4 px bursts).
+3. Remove the pre-battle slowdown stutter (GameSpec main_cpu_divisor).
+4. Engine commits for 4.3 + 4.5 in the segagenesisrecomp fork once 4.5
+   tests well.
 Later: Phase 5 comfort settings tab + README; maybe pull requests to mstan.
-Reminder: turn on GitHub 2FA before Nov 29.
+

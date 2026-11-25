@@ -260,3 +260,70 @@ plane unshifted. x=0 mask sprites never moved (native path too).
 Env: WOTES_VIDEO_SCALE=2..4 (default 4, 1 = off). Log line adds timing,
 sprite groups, fallbacks and a phase-1 "4x-vs-real" exactness check.
 Test: Step 26 -> measurements/quarter-1.*
+
+Phase 4.3 result (measurements/quarter-1.*, Nov 24, Step 26): self-check 0 differ (158/158),
+4x-vs-real mostly 0 (6/36 differed, small). Timing: avg 0.9 ms standing, 2-4 ms walking with
+3-4 sprite groups, max 10.6 ms. Trace: 36,876 pictures / 11,493 ticks = 3.21 per tick (want 4);
+1,495 intervals > 6.25 ms, 328 > 8.33 ms, clustered in walking stretches. User: 180-240 FPS,
+small stutters, mountain shadows flicker "like Sonic 1's waterfall".
+Cause 1: each picture re-ran the VDP renderer once per sprite group (up to 4) + composed up to
+16 variants per row. Cause 2: mountain shading is a 1-px checker in plane tiles (worldmap-1.log:
+reg12 always $81 = no shadow/highlight; sprite counts don't alternate), which flips with every
+pixel of scroll; on a TV it blurred into one shade.
+Phase 4.4 (game/wotes_video.c only): per-frame layer cache (8 sprite slots keyed by frame +
+member entries/positions, 2 plane slots keyed by frame + whole-pixel camera I,J), groups with no
+sprite on a row don't split that row into variants, dither blending: plane rows with ABAB runs
+(4+ px) that continue on a neighbouring row are marked at capture; after compose, marked
+non-sprite pixels in an RGB ABAB run get the A/B average. Exactness check now compares the
+pre-blend picture. Log adds "captures N, reused M, dither px". WOTES_DITHER_BLEND=0 = off.
+Test: Step 27 -> measurements/cache-1.*
+
+Phase 4.4 result (measurements/cache-1.*, Step 27): mountains fixed (user confirmed). Timing
+while walking still avg 2.4-4.7 ms, max 11.5 ms; captures reused ~50% walking (~85% standing):
+each picture lands on new quarter-pixel fractions, so the sprite grouping (and cache keys)
+change; the first picture of every frame always draws everything fresh. Trace: 3.68 pictures
+per tick, 2,915 gaps > 6.25 ms (was 1,494), 78 > 12.5 ms (was 6). Conclusion: CPU 4x drawing
+can't fit 4.17 ms reliably; move placement to the GPU.
+Phase 4.5 (Nov 25): GPU layers. Engine: game_video.h GameVideoLayer + GameVideo.
+presentation_layers (appended), main.c present_layers(): one streaming texture per slot
+(32 max), uploaded only when (slot, version) changes, SDL_RenderCopyF at fractional
+logical positions, per-layer clip rect, colour LUT applied at upload (alpha 0 kept),
+only with nearest filtering; trace rows of GPU pictures have interpolated=2 and a hash of
+layer versions/positions. Game: WVFrame keeps the real frame's raster rows (planes, sprite
+shown mask, backdrop); per frame: window-off plane capture (map under the panel) + one
+capture at the previous camera (revealed edge, margin 32 px); L0 = plane composite, L2 =
+high-priority plane pixels, W0/W2 = window composite (fixed); sprites decoded from SAT+VRAM
+into groups (offsets equal at phases 0/.37/.71), only where the real frame shows a sprite,
+front-to-back inside a group, groups ordered by front-most link index; once a second the
+layers composed at offset 0 must equal the real picture, else that frame -> CPU path.
+Dither blending applied to L0/L2 after the check. Log: "GPU layers: build avg/max ms,
+pictures, layers, check px, CPU-path frames, dither px".
+Test: Step 28 -> measurements/gpu-1.*
+
+Phase 4.5 result (measurements/gpu-1.*, Nov 25, Step 28): SUCCESS. User: no flicker noticed,
+mangohud 238-240. Trace: 38,194 pictures = 4.002 per tick; median 4.164 ms, p99 5.15, max 13.7;
+gaps > 6.25 ms: 157 (Step 27: 2,915), > 12.5 ms: 3 (was 78). 97.7% GPU pictures (interpolated=2),
+861 CPU-path. Build per frame avg 0.6-2.2 ms, max 4.4 ms; up to 9 layers.
+Open: exactness check failed 20/156 times (small: ~165-197 px when it fails) -> those frames used
+the CPU path; unchecked frames may carry the same small error. Next: dump a failing frame (which
+pixels: sprite overlap order between groups, back sprite under a front one of the other priority,
+or line-limit sprites) and fix the layer rule.
+
+Phase 4.5b (Nov 25, game/wotes_video.c): three likely sources of the check failures fixed:
+(1) cross-group sprite priority: a front sprite's pixel now clears back pixels from every
+sprite layer drawn above its own layer (lows by group order, then highs), e.g. a front LOW
+sprite over a back HIGH sprite of another group; (2) palette changes mid-frame: L0/L2/W0/W2
+use the real pixel wherever the real frame shows no sprite (exact by construction); (3) the
+window-off capture is used only inside the window; outside it the real plane rows.
+WOTES_LAYER_DUMP=<dir>: first 4 failing frames as layers-fail-N-{real,ours,diff}.png; log
+line adds failing px by kind (sprite / plane / window). Test: Step 29 -> gpu-2.*
+Phase 4.5b result (measurements/gpu-2.*, Step 29, ~81 s, no battle): layer check 0/78 failed
+(was 20/156), no dumps. 4.003 pictures/tick, p99 4.72 ms, gaps > 6.25 ms: 27, > 12.5 ms: 0.
+95.7% GPU pictures. User: "decent". Still to confirm in a battle.
+
+Walking hitch (user, Nov 25: "a stutter baked into the game, monsters often come after").
+worldmap-1.log: 7 single-frame camera holds while walking in 6000 frames; each = a frame where
+the main loop does not finish (it=0) and RAM changes jump to 230-280 bytes (normal ~50), next
+frame camera holds, then it=2 (catch-up). = lag frame (68000 time overrun), present in the
+original. Step 30: GameSpec.main_cpu_divisor = WOTES_CPU_HEADROOM (default 1 = original);
+V-int/DMA/raster/sound stay native (engine contract), so the game still ticks once per V-blank.
