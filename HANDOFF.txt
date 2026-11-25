@@ -53,5 +53,8 @@ Next
 3. Phase 6 DONE: dash (hold B while walking, map + town) and fast travel
    (hold A+C 1 s standing still on the world map -> inside the town's north
    gate), both in game/wotes_spec.c hooks; WOTES_DASH=0 / WOTES_FAST_TRAVEL=0.
-4. Optional, only if wanted: Phase 5 comfort settings tab + README (user is
-   happy with the defaults; not needed for personal use).
+4. Release (Step 41): README.md, LICENSE (PolyForm NC, from the engine),
+   packaging/linux (AppRun, .desktop, icon, README.txt), tools/release/
+   make_appimage.sh (separate build-release/ with GEN_ENABLE_TRACE and
+   SONIC_REVERSE_DEBUG OFF, refuses ROM/saves/logs). Then repo -> public,
+   release v1.0.0 with the AppImage.

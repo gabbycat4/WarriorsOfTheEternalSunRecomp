@@ -1,0 +1,37 @@
+#!/bin/sh
+# Warriors of the Eternal Sun Recompiled: Easy on the Eyes - AppImage entry point.
+#
+# The game keeps settings.ini, its saves and the launcher's ROM choice beside
+# its program, and loads the launcher's fonts and pictures from an assets/
+# folder next to it; an AppImage is read-only. So the program and assets are
+# copied once per version into
+#   ~/.local/share/WarriorsOfTheEternalSunRecomp
+# and run from there. Your settings and saves in that folder are kept across
+# updates. Your ROM never goes into the AppImage.
+HERE="$(dirname "$(readlink -f "$0")")"
+DATA="${WOTES_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/WarriorsOfTheEternalSunRecomp}"
+VERSION="$(cat "$HERE/VERSION")"
+
+if [ "$(cat "$DATA/VERSION" 2>/dev/null)" != "$VERSION" ] || [ ! -x "$DATA/WotESRecomp" ]; then
+    mkdir -p "$DATA" || exit 1
+    rm -rf "$DATA/assets"
+    cp -R "$HERE/usr/share/wotes/assets" "$DATA/assets" || exit 1
+    cp -f "$HERE/usr/share/doc/wotes/LICENSE" "$HERE/usr/share/doc/wotes/THIRD-PARTY-LICENSES.md" \
+          "$HERE/usr/share/doc/wotes/README.txt" "$DATA/" || exit 1
+    cp -f "$HERE/usr/bin/WotESRecomp" "$DATA/WotESRecomp.new" &&
+    mv -f "$DATA/WotESRecomp.new" "$DATA/WotESRecomp" &&
+    cp -f "$HERE/VERSION" "$DATA/VERSION" || exit 1
+fi
+
+# First start: high refresh rate (in-between pictures at the display's rate)
+# on, as tested. Everything else is the launcher's default; change it in the
+# game's Esc menu.
+if [ ! -f "$DATA/settings.ini" ]; then
+    printf '[video]\npresentation_rate = -1\nlinear_filter = 0\n' > "$DATA/settings.ini"
+fi
+
+# Run the copy: without $APPIMAGE the program anchors its files to its own
+# folder ($DATA) instead of the folder the .AppImage sits in.
+unset APPIMAGE
+cd "$DATA" || exit 1
+exec "$DATA/WotESRecomp" "$@"

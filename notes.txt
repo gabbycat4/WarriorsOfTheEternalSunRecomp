@@ -442,3 +442,14 @@ Fix (Step 39): D0 = (town spot - $60) packed; no direct camera writes needed.
 Step 39 result (step39.*, user: "everything seemed fine"): 3 fast travels, each landed exactly on
 (0BE9,0DD0) with camera (0B89,0D70); random battle and leaving/re-entering town fine. (Grey
 portraits in Step 38's screenshot were dead party members in that save, not the bug.) Phase 6 done.
+
+Release (Nov 25): engine RELEASING.md rules: native exe only, LICENSE (PolyForm Noncommercial
+1.0.0) + THIRD-PARTY-LICENSES.md inside, launcher assets/ next to the exe, no ROM/saves/logs,
+developer diagnostics off (our build/ had GEN_ENABLE_TRACE=ON and SONIC_REVERSE_DEBUG=ON, so the
+AppImage uses a separate build-release/), README with bring-your-own-ROM, license and source.
+Git history checked: no ROM / generated code / saves ever committed. AppRun copies the program +
+assets into ~/.local/share/WarriorsOfTheEternalSunRecomp once per version and runs it there with
+APPIMAGE unset (the engine anchors files to $APPIMAGE's folder otherwise, where assets/ is
+missing); first start writes settings.ini with presentation_rate = -1. SDL2 not bundled; built
+on CachyOS (needs an equally recent glibc). A CI build on an older Ubuntu (DuckTales style,
+ROM from an encrypted secret) would widen that; not done.

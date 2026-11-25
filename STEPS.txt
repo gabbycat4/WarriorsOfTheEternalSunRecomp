@@ -1,5 +1,39 @@
-# ===== Step 40: commit dash + fast travel (tested) =====
+# ===== Step 41: build the AppImage, try it, commit, publish =====
+# --- A. Build it (a separate clean build in build-release/, takes a while the first time;
+#        your normal build/ folder is not touched) ---
 cd ~/Projects/WarriorsOfTheEternalSunRecomp
-git add game/wotes_spec.c HANDOFF.txt notes.txt STEPS.txt
-git commit -m "Dash (hold B on map/town) and fast travel to the town (hold A+C on the world map)"
+bash tools/release/make_appimage.sh
+# It ends with "Built WarriorsOfTheEternalSun-EasyOnTheEyes-x86_64.AppImage" and a short
+# list of what is inside (program, licenses, readme, icon, launcher assets - no ROM).
+
+# --- B. Try it like a new player would ---
+./WarriorsOfTheEternalSun-EasyOnTheEyes-x86_64.AppImage
+# Choose your ROM in the launcher. Check: 240 FPS, smooth map, dash, fast travel.
+# Its own settings/saves folder: ~/.local/share/WarriorsOfTheEternalSunRecomp
+# (separate from your build/ saves). Close it and say what you saw.
+
+# --- C. Commit (after B looks good) ---
+git add .gitignore LICENSE README.md packaging tools/release STEPS.txt HANDOFF.txt notes.txt
+git commit -m "Linux AppImage packaging, README, license"
 git push
+
+# --- D. Make the repository public (on github.com) ---
+# 1. Open https://github.com/gabbycat4/WarriorsOfTheEternalSunRecomp
+# 2. Settings (top right of the repo page) -> General -> scroll to the bottom,
+#    "Danger Zone" -> Change repository visibility -> Change to public -> confirm.
+# 3. Back on the repo page: the gear icon next to "About" (right side) -> Description:
+#    Warriors of the Eternal Sun (Genesis) for Linux: 240 Hz smooth motion, easy on the eyes. AppImage. Bring your own ROM.
+#    -> Save changes.
+
+# --- E. Publish the AppImage as a release (on github.com) ---
+# 1. On the repo page: "Releases" (right side) -> "Create a new release"
+#    (or "Draft a new release").
+# 2. "Choose a tag": type  v1.0.0  -> "Create new tag: v1.0.0 on publish".
+# 3. Title:  Warriors of the Eternal Sun: Easy on the Eyes v1.0.0
+# 4. Description: copy the short text from packaging/linux/README.txt.
+# 5. Drag WarriorsOfTheEternalSun-EasyOnTheEyes-x86_64.AppImage into the
+#    "Attach binaries" box, wait for the upload, then "Publish release".
+
+# --- F. Check that someone else can build it (after D) ---
+cd /tmp && rm -rf wotes-test && git clone --recurse-submodules https://github.com/gabbycat4/WarriorsOfTheEternalSunRecomp.git wotes-test && ls wotes-test/segagenesisrecomp/external
+# It must clone without asking for a password (every submodule public).

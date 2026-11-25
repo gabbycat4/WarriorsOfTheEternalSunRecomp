@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Warriors of the Eternal Sun: Easy on the Eyes
+Comment=Native Linux port of Warriors of the Eternal Sun (Genesis) with 240 Hz smooth motion; needs your own ROM
+Exec=WotESRecomp
+Icon=wotes-easyontheeyes
+Categories=Game;RolePlaying;
+Terminal=false

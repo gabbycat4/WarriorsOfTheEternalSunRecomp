@@ -32,3 +32,8 @@ tools/m68k_runs
 
 # Phase 2 motion logs (large)
 measurements/
+
+# Packaging icon (the only picture that belongs in the repo)
+!packaging/linux/*.png
+# AppImage output
+*.AppImage
