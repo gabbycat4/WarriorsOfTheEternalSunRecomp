@@ -26,7 +26,10 @@ static unsigned s_iters;
 static uint8_t  s_prev_ram[0x10000];
 static int      s_have_prev;
 
-void wotes_motion_main_loop_pass(void) { s_iters++; }
+/* Running total of world-map main-loop passes (read by wotes_video.c: no pass
+ * for a while = battle or menu, where the eased camera applies). */
+unsigned long long g_wotes_loop_total;
+void wotes_motion_main_loop_pass(void) { s_iters++; g_wotes_loop_total++; }
 
 static uint32_t fnv(const uint8_t *p, size_t n)
 {

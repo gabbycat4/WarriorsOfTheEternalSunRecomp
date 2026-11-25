@@ -98,7 +98,7 @@ static void wotes_presentation_configure(int enabled)
     s_enabled = enabled;
     wv_init();
     s_latest = -1;
-    fprintf(stderr, "[WOTES-VIDEO] high refresh rate %s (step 4.5: GPU layers; 4x CPU pictures as fallback)\n",
+    fprintf(stderr, "[WOTES-VIDEO] high refresh rate %s (step 4.8: GPU layers, averaged battle camera, map memory; 4x CPU pictures as fallback)\n",
             enabled ? "ON" : "off");
 }
 
@@ -185,6 +185,13 @@ typedef struct {
     int      period;               /* learned step period (frames) */
     int      gaps[4], ngaps;
     int      slot;                 /* SAT entry in the latest frame */
+    /* Step 33: party members on the map (move through the world but stay on
+     * screen while the camera moves) are shown at the average of their last
+     * 4 screen positions: their lumpy diagonal steps (pause, then 2 px, or a
+     * side step while tracing the leader's path) become even. */
+    int      shx[5], shy[5], nsh;  /* screen positions, latest first */
+    int      votes;                /* recent camera-moving frames: +1 walks with the camera, -1 not */
+    int      party;
 } WVObj;
 
 static WVObj  s_obj[WV_MAX_OBJ];
@@ -308,6 +315,23 @@ static void wv_track(const WVFrame *f)
                 o->since = 0;
             } else if (o->since < 1000) {
                 o->since++;
+            }
+        }
+        {   /* screen history + party vote (Step 33) */
+            int sx = spr[k].x, sy = spr[k].y, dsx = 0, dsy = 0;
+            if (o->nsh) { dsx = sx - o->shx[0]; dsy = sy - o->shy[0]; }
+            if (!o->nsh || dsx > 16 || dsx < -16 || dsy > 16 || dsy < -16) { o->nsh = 0; o->votes = 0; o->party = 0; }
+            for (int h = 4; h > 0; h--) { o->shx[h] = o->shx[h - 1]; o->shy[h] = o->shy[h - 1]; }
+            o->shx[0] = sx; o->shy[0] = sy;
+            if (o->nsh < 5) o->nsh++;
+            int cdh = wrap10(s_cam_hs[1] - s_cam_hs[0]), cdv = wrap10(s_cam_vs[1] - s_cam_vs[0]);
+            if ((cdh || cdv) && o->nsh >= 2 && cdh <= 4 && cdh >= -4 && cdv <= 4 && cdv >= -4) {
+                int walks = abs(dsx) <= 2 && abs(dsy) <= 2 && (dsx - cdh != 0 || dsy + cdv != 0);  /* world step != 0 */
+                o->votes += walks ? 1 : -1;
+                if (o->votes > 3) o->votes = 3;
+                if (o->votes < -3) o->votes = -3;
+                if (o->votes >= 2) o->party = 1;
+                if (o->votes <= -2) o->party = 0;
             }
         }
         o->key = key; o->key2 = key2;
@@ -850,32 +874,167 @@ static int wotes_interpolate_scaled(double phase, uint32_t *image, int stride,
  * front ones (no holes when they separate). Once a second the layers are
  * composed at the frame's own positions on the CPU and must equal the real
  * picture, else that frame uses the CPU path. WOTES_VIDEO_GPU=0 = off. */
-#define LM 32
+#define LM 64                          /* margin: room for the eased camera to trail */
 #define LCW (WV_W + 2 * LM)
 #define LCH (WV_H + 2 * LM)
 #define WV_LGRP 14
 
 typedef struct { uint32_t px[WV_H * WV_W]; int x0, y0, x1, y1; } WVSLayer;   /* bbox: [x0,x1) x [y0,y1) */
 
-static int      s_gpu = -1;
+/* Step 35: map memory for the trailing camera. The VDP plane is only 256 px
+ * tall (224 shown): when the camera moves, the game reuses the rows that just
+ * left the screen for the rows coming in, so a view trailing the game camera
+ * by up to ~55 px saw rewritten rows (Step 34 video: a wrong strip at the top).
+ * Every frame the shown map pixels are kept here by WORLD position; the margin
+ * the trailing view reveals comes from here (it only trails toward places shown
+ * a moment ago), falling back to a capture at the previous camera. */
+#define WC 1024                                   /* world cache, wraps every 1024 px */
+#define WCB 8                                     /* stamp block size */
+static uint32_t s_wc0[WC * WC], s_wc2[WC * WC];   /* L0 / L2 colours by world position */
+static unsigned s_wcs[(WC / WCB) * (WC / WCB)];   /* frame stamp per 8x8 block (0 = never) */
+static unsigned s_wc_epoch_serial;                /* stamps older than this are invalid */
+static unsigned long long s_wc_hits;
+#define WC_MAX_AGE 120u                           /* frames */
+static int      s_wc_reset_pending = 1;           /* cut / missed frames: forget the memory */
+
+static int s_gpu = -1;
 static unsigned s_lay_serial;
 static int      s_lay_ok;
 static uint32_t s_L0[LCH * LCW], s_L2[LCH * LCW];
 static uint32_t s_W0[WV_H * WV_W], s_W2[WV_H * WV_W];
 static int      s_have_win, s_cx0, s_cx1, s_cy0, s_cy1;   /* non-window (scrolling) rectangle */
 static WVSLayer s_sl[WV_LGRP][2];
-static int      s_lgn, s_lg_rep[WV_LGRP], s_lg_rank[WV_LGRP], s_lg_order[WV_LGRP];
+static int      s_lgn, s_lg_rep[WV_LGRP], s_lg_rank[WV_LGRP], s_lg_order[WV_LGRP], s_lg_kind[WV_LGRP];
 static uint8_t  s_c0a[WV_H][WV_W], s_c0b[WV_H][WV_W], s_c1a[WV_H][WV_W], s_c1b[WV_H][WV_W];
 static uint8_t  s_lda[WV_H][WV_W], s_ldb[WV_H][WV_W];
 static double   s_lt_sum, s_lt_max;
 static unsigned s_lt_n, s_lpics, s_lmax, s_llog_serial;
 static unsigned long long s_lchecks, s_lcheck_fail, s_lcheck_last, s_lfall, s_lfall_check;
 
-static void wv_cam_offset(double p, double *o, double *ov)
+/* Step 32: eased battle camera (DuckTales "steady camera"). In battles the
+ * game's camera pans at a constant 4-5 px per frame that starts and stops
+ * instantly (and alternates 3/4-px steps), and it follows the active
+ * character in 8-px lurches (8 px in 4 frames, then still). The shown camera
+ * follows the game's camera with a critically damped spring instead: gentle
+ * start and stop, lurches merged into one glide, never overshooting. It trails
+ * the game camera by at most LM-4 px; everything is drawn in world positions,
+ * so characters stay exactly where they belong. World map (its main loop runs
+ * every frame): the shown camera is the game's camera, exactly as before.
+ * WOTES_CAM_EASE=0 off, or a stiffness (default 0.80 per frame).
+ * Step 34: a spring alone still pulsed with the 10-12 frame lurch rhythm
+ * (shown speed 0.3..1.3 px/frame, Step 33 user: "jerky once it moves"). The
+ * spring now follows the game camera averaged over 10 frames and then over 12
+ * frames (exact integrals of the frame-to-frame camera): any stop-go rhythm of
+ * 10 or 12 frames becomes one steady speed; big swings trail up to ~55 px. */
+extern unsigned long long g_wotes_loop_total;     /* wotes_motion.c */
+static double   s_ease_w = -1.0;
+static int      s_e_have;
+static unsigned s_e_serial, s_noloop;
+static unsigned long long s_loop_seen;
+static double   s_Hp, s_Hl, s_Vp, s_Vl;            /* game camera, unwrapped: previous / latest frame */
+static double   s_eH, s_eV, s_evH, s_evV, s_eT;    /* shown camera, velocity (px per frame), time (frames) */
+static double   s_e_maxlag;
+#define EH 64                                    /* camera history (frames) for the averages */
+static double   s_hH[EH], s_hV[EH];               /* game camera of frame k at [k % EH] */
+
+static int wv_easing(void) { return s_ease_w > 0.0 && s_noloop >= 30; }
+
+static void wv_ease_frame(const WVFrame *f)
 {
-    int dhs = wrap10(s_cam_hs[1] - s_cam_hs[0]), dvs = wrap10(s_cam_vs[1] - s_cam_vs[0]);
-    *o  = (dhs > 32 || dhs < -32) ? 0.0 : dhs * (p - 1.0);
-    *ov = (dvs > 32 || dvs < -32) ? 0.0 : dvs * (p - 1.0);
+    if (s_ease_w < 0.0) {
+        const char *e = getenv("WOTES_CAM_EASE");
+        s_ease_w = e && *e ? atof(e) : 0.80;
+        if (s_ease_w < 0.0 || s_ease_w > 2.0) s_ease_w = 0.80;
+        fprintf(stderr, "[WOTES-VIDEO] battle camera easing %s (%.2f)\n", s_ease_w > 0.0 ? "on" : "off", s_ease_w);
+    }
+    if (g_wotes_loop_total != s_loop_seen) { s_loop_seen = g_wotes_loop_total; s_noloop = 0; }
+    else if (s_noloop < 1000000u) s_noloop++;
+    int dh = wrap10(s_cam_hs[1] - s_cam_hs[0]), dv = wrap10(s_cam_vs[1] - s_cam_vs[0]);
+    if (!s_e_have || f->serial != s_e_serial + 1) {
+        s_Hl = s_Hp = s_eH = s_cam_hs[1]; s_Vl = s_Vp = s_eV = s_cam_vs[1];
+        s_evH = s_evV = 0.0; s_eT = (double)f->serial - 1.0; s_e_have = 1;
+        for (int k = 0; k < EH; k++) { s_hH[k] = s_Hl; s_hV[k] = s_Vl; }
+        s_wc_reset_pending = 1;
+    } else {
+        s_Hp = s_Hl; s_Vp = s_Vl; s_Hl += dh; s_Vl += dv;
+        if (dh > 32 || dh < -32) {                                       /* cut, not a pan */
+            s_Hp = s_eH = s_Hl; s_evH = 0.0;
+            for (int k = 0; k < EH; k++) s_hH[k] = s_Hl;
+            s_wc_reset_pending = 1;
+        }
+        if (dv > 32 || dv < -32) {
+            s_Vp = s_eV = s_Vl; s_evV = 0.0;
+            for (int k = 0; k < EH; k++) s_hV[k] = s_Vl;
+            s_wc_reset_pending = 1;
+        }
+    }
+    s_hH[f->serial % EH] = s_Hl; s_hV[f->serial % EH] = s_Vl;
+    s_hH[(f->serial + EH - 1) % EH] = s_Hp; s_hV[(f->serial + EH - 1) % EH] = s_Vp;
+    s_e_serial = f->serial;
+}
+
+/* Game camera at time t (frames; frame k's camera at t = k, linear between),
+ * and its exact integral from a to b. Times older than the history: oldest. */
+static double wv_cam_at(const double *h, double t)
+{
+    double lo = (double)s_e_serial - (EH - 2), hi = (double)s_e_serial;
+    if (t < lo) t = lo;
+    if (t > hi) t = hi;
+    double n = floor(t), fr = t - n;
+    unsigned k = (unsigned)n;
+    double a = h[k % EH], b = h[(k + 1) % EH];
+    return fr > 0.0 ? a + (b - a) * fr : a;
+}
+static double wv_cam_int(const double *h, double a, double b)
+{
+    double sum = 0.0, t = a;
+    while (t < b - 1e-12) {
+        double e = floor(t) + 1.0; if (e > b) e = b;
+        sum += (wv_cam_at(h, t) + wv_cam_at(h, e)) * 0.5 * (e - t);   /* linear piece: exact */
+        t = e;
+    }
+    return sum;
+}
+/* Average over 10 frames, then over 12 (the second one sampled finely). */
+static double wv_cam_avg(const double *h, double t)
+{
+    const double N1 = 10.0, N2 = 12.0; const int K = 24;
+    double acc = 0.0;
+    for (int i = 0; i < K; i++) {
+        double u = t - N2 + N2 * (i + 0.5) / K;
+        acc += wv_cam_int(h, u - N1, u) / N1;
+    }
+    return acc / K;
+}
+
+/* Advance the shown camera to phase p of the latest frame; return its offset
+ * from the latest game camera (o: hscroll units, ov: vscroll units). */
+static void wv_ease_to(double p, double *o, double *ov)
+{
+    double T = (double)s_e_serial - 1.0 + p, base = (double)s_e_serial - 1.0;
+    if (!wv_easing()) {
+        s_eH = s_Hp + (s_Hl - s_Hp) * p; s_eV = s_Vp + (s_Vl - s_Vp) * p;
+        s_evH = s_Hl - s_Hp; s_evV = s_Vl - s_Vp;
+        if (T > s_eT) s_eT = T;
+    } else {
+        double w = s_ease_w;
+        while (s_eT < T - 1e-9) {
+            double dt = T - s_eT; if (dt > 0.25) dt = 0.25;
+            s_eT += dt;
+            double q = s_eT - base; if (q < 0.0) q = 0.0; if (q > 1.0) q = 1.0;
+            double tH = wv_cam_avg(s_hH, base + q), tV = wv_cam_avg(s_hV, base + q);
+            s_evH += dt * (w * w * (tH - s_eH) - 2.0 * w * s_evH); s_eH += dt * s_evH;
+            s_evV += dt * (w * w * (tV - s_eV) - 2.0 * w * s_evV); s_eV += dt * s_evV;
+        }
+        double lim = LM - 4;
+        if (s_eH - s_Hl >  lim) s_eH = s_Hl + lim;
+        if (s_eH - s_Hl < -lim) s_eH = s_Hl - lim;
+        if (s_eV - s_Vl >  lim) s_eV = s_Vl + lim;
+        if (s_eV - s_Vl < -lim) s_eV = s_Vl - lim;
+    }
+    *o = s_eH - s_Hl; *ov = s_eV - s_Vl;
+    double lag = fabs(*o) > fabs(*ov) ? fabs(*o) : fabs(*ov);
+    if (lag > s_e_maxlag) s_e_maxlag = lag;
 }
 
 static void wv_shift_scroll(GVDP *w, int I, int J)
@@ -921,18 +1080,31 @@ static int wv_cap_planes(const WVFrame *f, int I, int J, uint8_t (*pa)[WV_W], ui
 
 /* Fractional screen offset of an object's sprites at phase p, relative to
  * where the latest frame put them. */
-static void wv_obj_offset(const WVFrame *f, int oi, double p, double *dx, double *dy)
+static int s_party_smooth = -1;                    /* WOTES_PARTY_SMOOTH=0 off */
+static int wv_party_smooth(const WVObj *ob)
+{
+    if (s_party_smooth < 0) { const char *e = getenv("WOTES_PARTY_SMOOTH"); s_party_smooth = !(e && *e == '0'); }
+    return s_party_smooth && ob->party && ob->nsh >= 5 && !wv_easing();
+}
+
+static void wv_obj_offset(const WVFrame *f, int oi, double p, double o, double ov, double *dx, double *dy)
 {
     const WVObj *ob = &s_obj[oi];
     uint32_t e = sat_base(&f->vdp) + (uint32_t)ob->slot * 8u;
     int sx0 = (rd16(&f->vdp, e + 6) & 0x1FF) - 128, sy0 = (rd16(&f->vdp, e) & 0x3FF) - 128;
-    double o, ov, x, y;
-    wv_cam_offset(p, &o, &ov);
-    obj_display(ob, p, &x, &y);
-    double X = x + o + s_cam_hs[1] - sx0, Y = y - ov - s_cam_vs[1] - sy0;
+    double x, y, X, Y;
+    if (wv_party_smooth(ob)) {                          /* screen-space average (Step 33) */
+        double ax = 0, ay = 0, bx = 0, by = 0;
+        for (int h = 0; h < 4; h++) { ax += ob->shx[h]; ay += ob->shy[h]; bx += ob->shx[h + 1]; by += ob->shy[h + 1]; }
+        ax /= 4; ay /= 4; bx /= 4; by /= 4;
+        X = bx + (ax - bx) * p - sx0; Y = by + (ay - by) * p - sy0;
+    } else {
+        obj_display(ob, p, &x, &y);
+        X = x + o + s_cam_hs[1] - sx0; Y = y - ov - s_cam_vs[1] - sy0;
+    }
     X -= 512.0 * floor((X + 256.0) / 512.0);
     Y -= 512.0 * floor((Y + 256.0) / 512.0);
-    if (fabs(X) > 48.0 || fabs(Y) > 48.0) X = Y = 0.0;   /* cut */
+    if (fabs(X) > 96.0 || fabs(Y) > 96.0) X = Y = 0.0;   /* cut */
     *dx = X; *dy = Y;
 }
 
@@ -992,7 +1164,24 @@ static unsigned long long wv_layers_check(const WVFrame *f)
     return d;
 }
 
-static int wv_build_layers(WVFrame *f)
+static inline unsigned wv_wc_i(int wx, int wy) { return (unsigned)(wy & (WC - 1)) * WC + (unsigned)(wx & (WC - 1)); }
+static inline unsigned wv_wc_b(int wx, int wy) { return (unsigned)((wy & (WC - 1)) / WCB) * (WC / WCB) + (unsigned)((wx & (WC - 1)) / WCB); }
+static void wv_wc_put(int wx, int wy, unsigned serial, uint32_t c0, uint32_t c2)
+{
+    unsigned i = wv_wc_i(wx, wy);
+    s_wc0[i] = c0; s_wc2[i] = c2; s_wcs[wv_wc_b(wx, wy)] = serial;
+}
+static int wv_wc_get(int wx, int wy, unsigned serial, uint32_t *c0, uint32_t *c2)
+{
+    unsigned st = s_wcs[wv_wc_b(wx, wy)];
+    if (!st || st < s_wc_epoch_serial || serial - st > WC_MAX_AGE) return 0;
+    unsigned i = wv_wc_i(wx, wy);
+    if (!s_wc0[i]) return 0;
+    *c0 = s_wc0[i]; *c2 = s_wc2[i];
+    return 1;
+}
+
+static int wv_build_layers(WVFrame *f, double o_start, double ov_start)
 {
     int W = f->width, H = f->height;
     if (!f->raster_ok || W <= 0 || W > WV_W || H <= 0 || H > WV_H || gvdp_interlace_double(&f->vdp)) return 0;
@@ -1016,14 +1205,23 @@ static int wv_build_layers(WVFrame *f)
             if (wv_in_scroll(x, y)) { s_c0a[y][x] = f->ra[y][x]; s_c0b[y][x] = f->rb[y][x]; }
         pa = s_c0a; pb = s_c0b;
     }
+    /* The shown camera only moves toward the latest one during this frame, so
+     * one capture at its current offset (rounded outward) covers every edge
+     * strip the frame's pictures reveal. Map: that is the previous camera. */
     int dhs = wrap10(s_cam_hs[1] - s_cam_hs[0]), dvs = wrap10(s_cam_vs[1] - s_cam_vs[0]);
     int I1 = (dhs > 32 || dhs < -32) ? 0 : -dhs, J1 = (dvs > 32 || dvs < -32) ? 0 : -dvs;
+    if (wv_easing()) {
+        I1 = (int)(o_start  < 0 ? floor(o_start)  : ceil(o_start));
+        J1 = (int)(ov_start < 0 ? floor(ov_start) : ceil(ov_start));
+    }
     int Dx = I1, Dy = -J1;              /* latest (x,y) shows at (x+Dx, y+Dy) at the previous camera */
     int have_c1 = (I1 || J1) && wv_cap_planes(f, I1, J1, s_c1a, s_c1b);
 
     uint32_t pal[GVDP_OUTPUT_PALETTE_SIZE];
     wv_palette(v, f->host, pal);
 
+    int wx0 = (int)s_Hl, wy0 = (int)s_Vl;               /* world = (x - H, y + V) */
+    if (s_wc_reset_pending) { s_wc_epoch_serial = f->serial; s_wc_reset_pending = 0; }
     for (int cy = 0; cy < LCH; cy++) {
         int y = cy - LM, yc = y < 0 ? 0 : y >= H ? H - 1 : y;
         uint32_t *r0 = &s_L0[cy * LCW], *r2 = &s_L2[cy * LCW];
@@ -1036,6 +1234,8 @@ static int wv_build_layers(WVFrame *f)
                     r0[cx] = rc; if (r2[cx]) r2[cx] = rc;
                 }
             }
+            else if (wv_wc_get(x - wx0, y + wy0, f->serial, &r0[cx], &r2[cx]))
+                s_wc_hits++;
             else if (have_c1 && xs >= 0 && xs < W && ys >= 0 && ys < H)
                 wv_plane_px(s_c1a[ys][xs], s_c1b[ys][xs], f->rbd[ys], pal, &r0[cx], &r2[cx]);
             else { r0[cx] = pal[f->rbd[yc]] | 0xFF000000u; r2[cx] = 0; }
@@ -1052,6 +1252,9 @@ static int wv_build_layers(WVFrame *f)
             }
         }
 
+    for (int y = s_cy0; y < s_cy1; y++) for (int x = s_cx0; x < s_cx1; x++)
+        wv_wc_put(x - wx0, y + wy0, f->serial, s_L0[(y + LM) * LCW + x + LM], s_L2[(y + LM) * LCW + x + LM]);
+
     /* Sprite groups: sprites whose offsets match at three phases move together. */
     for (int g = 0; g < WV_LGRP; g++) for (int k = 0; k < 2; k++) {
         WVSLayer *L = &s_sl[g][k];
@@ -1066,24 +1269,23 @@ static int wv_build_layers(WVFrame *f)
     for (int i = 0; i < n; i++) {
         sg[i] = 0;
         int oi = -1;
-        if (spr[i].x != -128)                               /* x = 0: line mask, no pixels */
+        int cxm = spr[i].x + spr[i].w / 2, cym = spr[i].y + spr[i].h / 2;
+        if (spr[i].x != -128 && wv_in_scroll(cxm, cym))     /* masks and side-panel sprites stay put */
             for (int k = 0; k < WV_MAX_OBJ; k++)
                 if (s_obj[k].used && s_obj[k].seen && s_obj[k].slot == spr[i].entry) { oi = k; break; }
         if (oi >= 0) {
-            double s6[6]; int moving = 0;
-            for (int k = 0; k < 3; k++) {
-                wv_obj_offset(f, oi, ph[k], &s6[2 * k], &s6[2 * k + 1]);
-                moving |= fabs(s6[2 * k]) > 1e-9 || fabs(s6[2 * k + 1]) > 1e-9;
-            }
-            if (moving) {
+            double s6[6];                                   /* own motion only (camera is common) */
+            for (int k = 0; k < 3; k++) wv_obj_offset(f, oi, ph[k], 0.0, 0.0, &s6[2 * k], &s6[2 * k + 1]);
+            {
                 int g = 1;
+                int kind = wv_party_smooth(&s_obj[oi]);
                 for (; g < s_lgn; g++) {
-                    int same = 1;
+                    int same = s_lg_kind[g] == kind;
                     for (int k = 0; k < 6; k++) if (fabs(sig[g][k] - s6[k]) > 1e-6) { same = 0; break; }
                     if (same) break;
                 }
                 if (g == s_lgn && s_lgn < WV_LGRP) {
-                    memcpy(sig[g], s6, sizeof s6); s_lg_rep[g] = oi; s_lg_rank[g] = INT_MAX; s_lgn++;
+                    memcpy(sig[g], s6, sizeof s6); s_lg_rep[g] = oi; s_lg_rank[g] = INT_MAX; s_lg_kind[g] = kind; s_lgn++;
                 }
                 if (g < s_lgn) sg[i] = g;                  /* too many groups: stays put */
             }
@@ -1176,10 +1378,13 @@ static int wotes_presentation_layers(double phase, GameVideoLayer *out, int max,
     wv_dither_env();
     wv_advance(f);
 
+    if (f->serial != s_e_serial || !s_e_have) wv_ease_frame(f);
+    double o, ov;
+    wv_ease_to(phase, &o, &ov);
     if (f->serial != s_lay_serial) {
         double t0 = wv_now_ms();
         s_lay_serial = f->serial;
-        s_lay_ok = wv_build_layers(f);
+        s_lay_ok = wv_build_layers(f, o, ov);
         if (!s_lay_ok) s_lfall++;
         double t = wv_now_ms() - t0;
         s_lt_sum += t; s_lt_n++; if (t > s_lt_max) s_lt_max = t;
@@ -1188,19 +1393,20 @@ static int wotes_presentation_layers(double phase, GameVideoLayer *out, int max,
             if (s_log)
                 fprintf(stderr, "[WOTES-VIDEO] frame %u GPU layers: build avg %.2f ms max %.2f ms, "
                         "%u pictures, up to %u layers, check %llu px (%llu/%llu failed), "
-                        "CPU-path frames %llu, dither px %llu | failing px: sprite %llu, plane %llu, window %llu\n",
+                        "CPU-path frames %llu, dither px %llu | failing px: sprite %llu, plane %llu, window %llu"
+                        " | camera %s, max trail %.1f px, edge px from map memory %llu\n",
                         f->serial, s_lt_n ? s_lt_sum / s_lt_n : 0.0, s_lt_max, s_lpics, s_lmax,
                         s_lcheck_last, s_lcheck_fail, s_lchecks, s_lfall, s_dither_px,
-                        s_ld_spr, s_ld_plane, s_ld_win);
+                        s_ld_spr, s_ld_plane, s_ld_win, wv_easing() ? "eased" : "exact", s_e_maxlag, s_wc_hits);
+            s_e_maxlag = 0.0; s_wc_hits = 0;
             s_lt_sum = s_lt_max = 0; s_lt_n = s_lpics = s_lmax = 0; s_dither_px = 0;
         }
     }
     if (!s_lay_ok || max < 4 + 2 * WV_LGRP) return 0;
 
-    double o, ov, gx[WV_LGRP], gy[WV_LGRP];
-    wv_cam_offset(phase, &o, &ov);
+    double gx[WV_LGRP], gy[WV_LGRP];
     gx[0] = gy[0] = 0.0;
-    for (int g = 1; g < s_lgn; g++) wv_obj_offset(f, s_lg_rep[g], phase, &gx[g], &gy[g]);
+    for (int g = 1; g < s_lgn; g++) wv_obj_offset(f, s_lg_rep[g], phase, o, ov, &gx[g], &gy[g]);
     int k = 0, scroll = s_cx1 > s_cx0 && s_cy1 > s_cy0;
     if (scroll) wv_layer(&out[k++], 0, s_L0, LCW, LCH, LCW, -LM + o, -LM - ov, 1);
     if (s_have_win) wv_layer(&out[k++], 2, s_W0, f->width, f->height, WV_W, 0, 0, 0);

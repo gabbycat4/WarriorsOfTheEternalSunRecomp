@@ -46,16 +46,11 @@ Done
 - Phase 4.5b confirmed in a battle too (gpu-2.*: check 0/126 failed).
 
 Next
-1. Step 30a: commit. Step 30 (NOT TESTED YET): WOTES_CPU_HEADROOM=2
-   (GameSpec.main_cpu_divisor in game/wotes_spec.c). Cause of the walking
-   hitch: lag frames (worldmap-1.log: 7 in 6000 frames, heavy frame with
-   ~230-280 RAM bytes changed -> main loop misses a frame -> camera holds 1
-   frame -> 2 passes next frame). Claude counts lag frames in
-   measurements/headroom-1.log (it=0 frames while walking).
-2. Eased battle camera: user (Nov 25) also sees jerks when characters move
-   in battle, not only the enemy <-> party swing (pans are 2-4 px bursts).
-3. Remove the pre-battle slowdown stutter (GameSpec main_cpu_divisor).
-4. Engine commits for 4.3 + 4.5 in the segagenesisrecomp fork once 4.5
-   tests well.
+1. Lag frames solved: CPU headroom 4x default (game/wotes_spec.c,
+   WOTES_CPU_HEADROOM=1 = original timing).
+2. Steps 33-35 DONE (user: "perfect"): random battles back, diagonal party
+   smoothing, averaged battle camera + map memory, all on by default.
+3. Next: Phase 5 - comfort settings tab (headroom, party smoothing, battle
+   camera, dither blending as menu options) + README.
 Later: Phase 5 comfort settings tab + README; maybe pull requests to mstan.
 

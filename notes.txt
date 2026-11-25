@@ -327,3 +327,87 @@ the main loop does not finish (it=0) and RAM changes jump to 230-280 bytes (norm
 frame camera holds, then it=2 (catch-up). = lag frame (68000 time overrun), present in the
 original. Step 30: GameSpec.main_cpu_divisor = WOTES_CPU_HEADROOM (default 1 = original);
 V-int/DMA/raster/sound stay native (engine contract), so the game still ticks once per V-blank.
+Step 30 result (measurements/headroom-1.log, 2x, 17,833 frames ~5 min): walking holds 9
+(original rate 7 per 6000 frames -> ~21 expected): about 1/3 left. Each remaining one is the same
+shape (heavy frame it=0, 255-520 RAM bytes, then one held frame). User: hitch gone except one,
+near a new area (bridge); 3 holds cluster at frames 12321-12459. Headroom does not scale DMA
+stalls or IRQ handlers (main_cpu_clock.h), so Step 31 = 4x to separate CPU-bound from DMA-bound.
+Step 31 result (measurements/headroom-2.log, 4x, 15,554 frames): lag holds while walking 0 in
+6,782 walking frames (2x: 9 in 6,280; 1x: 7 in ~2,900). The main-loop counter shows 0/2 pairs in
+~20% of walking frames at 4x (only phase of the count vs the frame edge: camera moves every frame
+and follower steps are identical at 1x/2x/4x: tile $508 1 px ~74-77%, 2 px ~19-22%, 0-then-2
+~25-30 per 1000). User's one hitch: at an area change (area load = ~120 frames with no update;
+not a lag frame). => game/wotes_spec.c default headroom 4 (WOTES_CPU_HEADROOM=1 = original).
+mangohud frame graph: flat 4.2 ms with rare blips (max 12.3 ms) = the few late pictures (Step 29:
+27 gaps > 6.25 ms in 81 s), not visible.
+
+Phase 4.6: eased battle camera (Nov 25). battle-1.log camera: 14 moves; swings at a constant
+~4.5 px/frame (alternating 3/4 and 2/3 px steps) starting and stopping instantly; following
+moves of 4 frames (3,3,1,1 = 8 px, then still) chasing the 8-px character hops = stop-go.
+game/wotes_video.c: shown camera = critically damped spring (w = 0.40 per frame, substeps of 1/4
+frame) toward the game camera interpolated between frames, only when the world-map main loop has
+not run for 30 frames (battles; g_wotes_loop_total in wotes_motion.c); map = exact as before.
+Layers: LM 48 px, trail clamp 44 px; edge capture at the shown camera's current offset (rounded
+outward; covers all pictures of the frame since it only moves toward the latest camera); sprite
+groups: group 0 = screen-fixed (masks, side-panel sprites, untracked), every tracked world sprite
+in a group by its own-motion signature, offset = own motion + camera offset. Log line adds
+camera exact/eased + max trail. WOTES_CAM_EASE=0 off / stiffness.
+Offline replay on battle-1 (4 pictures per frame): largest speed change between pictures
+1.12 px -> 0.04 px; max step per picture 1.25 -> 1.02 px; max trail 21.9 px.
+Note: a frame that falls back to the CPU path in battle would show the exact camera (a jump of up
+to the trail); battle layer checks were 0 failures in Step 29.
+Also in this build: CPU headroom 4x default (Step 31).
+
+Step 32 result (ease-1.*, user Nov 25): NO random battles in ~3.5 min at 4x headroom (Step 31 run
+had at least one). Cause found in the generated code:
+- Main loop $000608: st $A915 ($FF); if a new frame already began ($FF8004 != D3) skip the wait
+  ($00BA70: spins until $FF8004 changes) and keep $FF; else wait, then sf $A915.
+- After the pass ($0006E2): $A915 = $FF ("late") if $FF8004 changed, or V counter ($C00008>>8)
+  < $10, or > $70 while not in V-blank (VDP status bit 3); on time if line $10-$70 or in V-blank.
+- Encounter routine $012CD8 (called at $00070C): with an encounter pending ($FFA324 != 0, after
+  $005BEC with A0=$8ED4): if $A915 == 0 -> $01306E, then $A8CC = 1 (battle starts); if $A915 != 0
+  -> $8CE2 = 2 and $A324 = 0: the encounter is CANCELLED.
+- At 4x the pass ends so early that the beam is on lines 0-15 of the next screen: false "late",
+  encounters cancelled. (No idle-loop RNG: the wait only reads the frame counter.)
+Fix (game/wotes_spec.c instruction hook at $012CD8, return address $000712 only, headroom > 1
+only): if $A915 != 0 and no new frame ((u8)D3 == $FF8004) and the beam is on lines 0-15, clear
+$A915. Real overruns keep it. Log: "[WOTES] encounter check: false "late" pass cleared (n)".
+Diagonal walking (user: "a little blurry / different"): camera moves (+-1,+-1) per frame on
+diagonals = 1.41 px/frame (original game speed). Followers ($508/$511/$51A) step unevenly on
+diagonals: even (1,1) only 53-71%, (2,2) jumps 6-16%, side steps; leader ($4FF) 100% even.
+Fix: tracker keeps 5 screen positions per object and a party vote (camera moving, object moves
+in the world but its screen step <= 2 px); party members on the map (not in battle) are shown
+at the average of their last 4 screen positions (no lag for things moving with the camera).
+Sprite groups keep screen-averaged and world objects apart. WOTES_PARTY_SMOOTH=0 off.
+Replay (headroom-2): party on-screen jumps >= 1 px per frame: diagonal 24.8% -> 13.6%, straight
+16.5% -> 12.9%; >= 2 px: diagonal 7.1% -> 5.1%, straight 7.8% -> 1.9%; max 4.8 px from the game's
+spot. Averages of 6/8 gain little (diag >=2px 4.0/3.2%) for 7-10 px displacement: kept 4.
+Test: Step 33 (includes the untested Step 32 battle camera).
+
+Step 33 result (step33.*, user Nov 25): diagonal party smoothing "looks great"; random battles
+normal again (false-late cleared thousands of times on the map); battle camera "really jerky
+once it starts moving". Layers fine (check 0 failures, no CPU-path frames in battle; max trail
+<= 8.6 px). Cause: the game's battle follow is stop-go (+4,+4 then 8 frames still, a 10-frame
+rhythm at 4x; 3,3,1,1 + 8 still = 12 frames in battle-1 at 1x); a spring (w 0.4) reacts within
+~6 frames, so the shown camera pulsed 0.3..1.3 px/frame ten times a second.
+Step 34: spring (w 0.8) now follows the game camera averaged over 10 frames then 12 frames
+(exact integrals of the piecewise-linear camera, 64-frame history). Offline (Python, both
+battle logs): following speed steady (10-rhythm 0.80..0.80, 12-rhythm 0.67..0.67); largest speed
+change between pictures 0.020 px; swings trail up to ~54 px -> LM 64, clamp 60. The C code
+(extracted into ~/ease_test harness) on step33 frames 6800-7200: +4 +4 lurches -> steady 0.80.
+User report: battle cursor box can be moved off the character beyond its range and must be moved
+back ("not in the original"). Game logic, not drawing. Step 34B tests at WOTES_CPU_HEADROOM=1.
+
+Step 34 result (user, Nov 25): Part B: the white cursor box leaving the character happens at
+original CPU timing too = original game rule (not a bug); original timing also brings the map
+lag hitch back. Part A (phone video 54ccc553-dD.mp4, 12 s): a wrong, coarse strip along the top
+edge of the picture while the battle camera moves. Cause: the plane is 256 px tall (224 shown);
+the game rewrites the rows that just left the screen with incoming rows, and the averaged camera
+trails the game camera by up to ~55 px, so its margin showed rewritten rows (also from the
+previous-camera capture, which reads the same VRAM).
+Step 35 (game/wotes_video.c): world-position map memory (1024x1024 wrap, L0/L2 colours, 8x8 block
+frame stamps; stores the shown scroll rectangle every frame before blending; entries valid for 120
+frames, forgotten on cuts / missed frames). Margin pixels come from it first, then the
+previous-camera capture, then backdrop. Log adds "edge px from map memory".
+Step 35 result (step35.*, user: "I think it's perfect"): layer checks 0/203 failed, battle trail up
+to 51.6 px (within the 60 px clamp), random battles normal. Phase 4 motion work done.
